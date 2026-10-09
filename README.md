@@ -29,12 +29,127 @@ npm run preview   # serve the production build locally
 
 - `src/core/project` — versioned project types, validation, JSON serialization, and the `ProjectPersistence` interface. An IndexedDB adapter is intentionally deferred.
 - `src/core/commands` — typed immutable edits and bounded undo/redo history.
-- `src/core/transport` — tempo-independent transport state, sixteenth-note clock, and position formatting.
-- `src/audio` — the `AudioEngine` lifecycle contract and browser Web Audio implementation. Audio context initialization is only attempted after the user presses **Enable audio**.
+- `src/core/time` — the musical time model: the sixteenth-note grid, bars/beats/subdivisions, and a tempo map that converts between step positions and seconds.
+- `src/core/events` — musical event data (sample triggers, sustained notes) plus the pure translation from project data to a playable event list.
+- `src/core/transport` — UI transport state and `TransportClock`, the single authority that maps audio-clock time to musical position.
+- `src/audio` — `BrowserAudioEngine` (context lifecycle, audio graph, voices), the lookahead `Scheduler`, and the lookahead timer.
 - `src/features` — focused UI modules for the transport, Channel Rack, Piano Roll, Playlist, Mixer, and asset browser.
 
 Project content, transient panel/selection state, transport position, persistence, and browser audio objects are kept in separate layers. Pattern steps, piano-roll notes, tempo, time signature, and arrangement clips are editable and undoable. The starter project is currently held in memory only.
 
+## Audio engine
+
+### Ownership
+
+`BrowserAudioEngine` is the only component that touches Web Audio. It owns, in this order:
+
+1. the `AudioContext` (created on the first user gesture, never before);
+2. the `AudioGraph` — channel buses → master gain → safety limiter → destination;
+3. the `VoicePool` — every sounding node, so a stop can release all of them;
+4. the `TransportClock` — musical position as a pure function of `context.currentTime`;
+5. the `Scheduler` — which events to queue, and when.
+
+Musical data never holds a node. The project model is translated once into plain `MusicalEvent`
+objects (`{ kind: 'sample' | 'note', step, channelId, … }`), and those objects are what the
+scheduler queues. A MIDI output or an offline renderer can implement the same `MusicalEventSink`
+interface later without touching the transport or the UI.
+
+### Scheduling design
+
+Sound timing comes from the audio clock only:
+
+- A timer wakes every **25 ms** (a `Worker` timer when available, `setInterval` as a fallback,
+  because browsers throttle background-tab timers to ~1 s and that would starve the queue).
+- Each tick queues every event that starts within the next **120 ms** (`lookaheadSeconds`),
+  scheduling each voice at its exact `AudioContext` time.
+- Rendering is never in the timing path. `requestAnimationFrame` only reads
+  `getPlayheadSteps()` to draw the playhead, so a slow frame cannot delay or duplicate a note.
+
+Consequences:
+
+- Timer jitter only changes how early events are queued, not when they sound. Events are
+  sample-accurate as long as a tick arrives before the lookahead window closes.
+- The lookahead is the real latency/budget trade-off: 120 ms is far more than a 25 ms tick, and
+  small enough that edits and tempo changes take effect almost immediately.
+- Events more than 10 ms late are dropped rather than fired behind the clock (`lateGraceSeconds`).
+  After a long stall the scheduler skips to the cycle containing the current time instead of
+  firing a burst of stale notes.
+
+### Musical time
+
+The atomic unit is the sixteenth-note step (16 steps per whole note). `TransportClock` stores an
+anchor `(anchorTime, anchorStep)` and a tempo map, and derives position as
+`stepAtSeconds(secondsAtStep(anchorStep) + (now - anchorTime))`. Every reconfiguration re-anchors
+at the current instant, which keeps floating-point error bounded to one loop and makes each
+operation's semantics explicit:
+
+| Operation | Semantics |
+| --- | --- |
+| `play` | Starts at the parked position with 60 ms of scheduling headroom, so the first event is never queued in the past. Initializes the `AudioContext` if needed — it is always called from a gesture. |
+| `pause` | Freezes the musical position and releases every sounding voice. |
+| `stop` | Releases every voice, parks at the region start, resets the loop iteration. |
+| `restart` | `stop()` then `play()`. |
+| `seek` | Moves the playhead, releases sounding voices, and re-cursors the scheduler. Playback continues from the new position; the current window is queued immediately so events at the target still sound. |
+| tempo / signature change | The musical position is preserved and only the rate changes. Already-queued voices are cancelled and re-cursored, so nothing sounds twice at two tempos. |
+| loop | The visible region wraps when looping is on; when it is off, playback stops at the region end. Notes are clamped at the boundary, so nothing hangs across a loop. |
+
+### Failures
+
+`AudioEngineError` carries a classified `reason` (`unsupported`, `autoplay-blocked`,
+`device-unavailable`, `context-closed`, `scheduling-failed`, `unknown`) and a message written for
+users, not developers. The engine also watches `AudioContext.state`: a closed context tears the
+graph down, and an `interrupted` context (iOS/Safari) pauses transport and reports the failure.
+
+### Timing limitations
+
+- **Output latency.** Events are sample-accurate on the audio clock, but they are *heard*
+  `outputLatency` later (typically 10–40 ms, far more over Bluetooth). The playhead compensates by
+  reading the position `outputLatency` in the past; the label in the transport bar reports the
+  measured value.
+- **Background tabs.** A `Worker` timer keeps the queue filled, but some browsers still throttle
+  or suspend audio when a tab is hidden for a long time. Recovery is automatic: late events are
+  dropped and the next cycle is picked up on time.
+- **Device changes.** Web Audio does not expose device selection; if the output device disappears
+  the context may go to `interrupted`/`closed`, which the engine surfaces as an error.
+- **Quantisation of the visual playhead.** The UI highlights sixteenth-note steps, so the drawn
+  playhead moves in steps (~8 times per second at 124 BPM) even though the audio position is
+  continuous.
+- **No sample-accurate automation yet.** Tempo is constant per project (the tempo map supports
+  future automation); mixer faders and effects are still deferred.
+
+## Testing
+
+```sh
+npm test
+```
+
+112 tests cover the audio and editing layers:
+
+- `src/core/time` — grid maths, tempo-map integration and inversion, bar/beat/sixteenth
+  round-trips, odd signatures (6/8, 7/8, 12/8), clamping, and formatting.
+- `src/core/events` — project → event translation (clip placement, pattern repeat, clip
+  truncation, sorting, unique ids, velocity clamping) and event-list helpers.
+- `src/core/transport` — `TransportClock` start/pause/resume/stop/seek, tempo and signature
+  changes, loop wrapping (including many wraps drift-free and stalled clocks), cycle timing
+  across a loop boundary, and snapshots.
+- `src/audio/scheduler` — lookahead windowing, loop continuity, one-event-per-iteration,
+  out-of-range and late events, note clamping at the loop end, and re-cursoring after
+  seek/tempo/sequence changes.
+- `src/audio/AudioEngine` — lifecycle, autoplay and device failures, context interruption,
+  scheduled voice times, loop synchronisation over repeated passes, stop/pause/seek/restart,
+  sequence swaps, latency-compensated playhead, and diagnostics — plus two end-to-end tests that
+  play the starter project through the engine. The engine is tested against an injectable
+  `AudioContext` double (`src/audio/__fixtures__`), so no browser is required.
+- `src/audio/voices` — voice construction, envelopes, pool cancellation and release.
+- `src/audio/timer` — interval timer behaviour and the worker fallback.
+- `src/App.audio.test.tsx` — the React wiring in a DOM: mounting never touches audio, play
+  schedules voices, stop releases them, and the loop toggle and test tone work.
+
 ## Current limits
 
-This phase establishes the editing and application foundation, not the complete audio engine. Play/stop drives a visual transport preview only. Enabling audio creates or resumes an `AudioContext`, but no instrument, sample, scheduler, or audio output is connected. Master metering, mixer faders/routing, the sample/instrument/preset browser, IndexedDB persistence, project import/export, effects, and plugin hosting are explicitly deferred and labeled in the UI. No external fonts, assets, or network services are required.
+The engine plays the starter kit, but it is not a complete instrument: the drum kit and synth are
+synthesised placeholders (no sample assets, no sampler), channels have no inserts, and the mixer
+has no faders. Master metering, IndexedDB persistence, project import/export, effects, and plugin
+hosting remain deferred and labeled in the UI. Drum lanes trigger samples from the Channel Rack
+step grid; instrument lanes play piano-roll notes. No external fonts, assets, or network services
+are required.

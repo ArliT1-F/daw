@@ -12,4 +12,14 @@ describe('studio workspace shell', () => {
     expect(markup).toContain('Transport controls');
     expect(markup).toContain('Master level meter unavailable');
   });
+
+  it('exposes the transport controls backed by the audio engine', () => {
+    const markup = renderToStaticMarkup(<App />);
+
+    expect(markup).toContain('LOOP');
+    expect(markup).toContain('Seek within the region');
+    expect(markup).toContain('Play a test tone');
+    expect(markup).toContain('Enable audio');
+    expect(markup).toContain('Pattern editing active · scheduled audio engine online');
+  });
 });

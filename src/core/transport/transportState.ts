@@ -12,7 +12,9 @@ export type TransportAction =
   | { type: 'play' }
   | { type: 'pause' }
   | { type: 'stop' }
-  | { type: 'tick'; cycleSteps?: number };
+  | { type: 'tick'; cycleSteps?: number }
+  /** Set an absolute position, e.g. from a seek or from the audio-clock playhead. */
+  | { type: 'position'; positionStep: number; cycleSteps?: number };
 
 export const DEFAULT_VISIBLE_BARS = 8;
 export const STEPS_PER_QUARTER_NOTE = 4;
@@ -43,6 +45,11 @@ export function transportReducer(state: TransportState, action: TransportAction)
       return state.status === 'stopped'
         ? state
         : { ...state, positionStep: (state.positionStep + 1) % Math.max(1, action.cycleSteps ?? 128) };
+    case 'position': {
+      const cycleSteps = Math.max(1, action.cycleSteps ?? 128);
+      const wrapped = ((Math.floor(action.positionStep) % cycleSteps) + cycleSteps) % cycleSteps;
+      return state.positionStep === wrapped ? state : { ...state, positionStep: wrapped };
+    }
     default: {
       const exhaustiveCheck: never = action;
       return exhaustiveCheck;

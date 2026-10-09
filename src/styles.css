@@ -133,6 +133,44 @@ button:disabled { cursor: not-allowed; }
 .icon-button:hover:not(:disabled) { color: #edf2ee; border-color: #3c4849; background: #273033; }
 .icon-button:disabled { color: #46514e; cursor: not-allowed; }
 .transport-stop { border-color: #313a3d; background: #202629; }
+.transport-loop {
+  height: 30px;
+  padding: 0 9px;
+  border: 1px solid #313a3d;
+  border-radius: var(--radius-sm);
+  color: #8d9a95;
+  background: #202629;
+  font-family: var(--font-mono);
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: .12em;
+  cursor: pointer;
+  transition: color .15s, background .15s, border-color .15s;
+}
+.transport-loop:hover { color: #edf2ee; border-color: #3c4849; background: #273033; }
+.transport-loop.is-active { color: #c5ed7d; border-color: rgba(197, 237, 125, .28); background: rgba(115, 140, 78, .14); }
+.test-tone-button {
+  width: auto;
+  padding: 0 8px;
+  border-color: #313a3d;
+  background: #202629;
+  font-family: var(--font-mono);
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: .12em;
+}
+.seek-control { display: grid; align-items: center; min-width: 0; }
+.seek-control input { width: 108px; height: 20px; margin: 0; accent-color: var(--color-accent); cursor: pointer; }
+.sr-only-text {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
 .position-readout { display: grid; gap: 2px; min-width: 125px; text-align: center; font-variant-numeric: tabular-nums; }
 .position-label { color: #687571; font-family: var(--font-mono); font-size: 8px; letter-spacing: .09em; }
 .position-value { color: #e2e9e4; font-family: var(--font-mono); font-size: 14px; font-weight: 500; letter-spacing: .07em; }

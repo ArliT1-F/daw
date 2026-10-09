@@ -1,0 +1,36 @@
+export {
+  AudioEngineError,
+  BrowserAudioEngine,
+  type AudioEngine,
+  type AudioEngineState,
+  type AudioEngineStatus,
+  type AudioErrorReason,
+  type BrowserAudioEngineOptions,
+} from './AudioEngine';
+export { AudioGraph, type AudioGraphOptions } from './AudioGraph';
+export {
+  Scheduler,
+  DEFAULT_INTERVAL_MS,
+  DEFAULT_LATE_GRACE_SECONDS,
+  DEFAULT_LOOKAHEAD_SECONDS,
+  type SchedulerClock,
+  type SchedulerDiagnostics,
+  type SchedulerOptions,
+  type SchedulerTransport,
+} from './scheduler';
+export {
+  VoicePool,
+  createVoice,
+  midiToFrequency,
+  resolveDrumVoice,
+  VOICE_RELEASE_SECONDS,
+  type DrumVoiceId,
+  type Voice,
+} from './voices';
+export {
+  createBestAvailableTimer,
+  createIntervalTimer,
+  createWorkerTimer,
+  type FallbackTimer,
+  type RepeatingTimer,
+} from './timer';

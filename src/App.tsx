@@ -1,9 +1,10 @@
-import { useEffect, useReducer, useRef, useState } from 'react';
-import { BrowserAudioEngine, type AudioEngineStatus } from './audio/AudioEngine';
+import { useCallback, useEffect, useReducer, useRef, useState } from 'react';
+import { BrowserAudioEngine, type AudioEngineState } from './audio/AudioEngine';
 import { ErrorNotice } from './components/ErrorNotice';
 import { createAppError, type AppError, type ErrorSource } from './core/errors';
 import { applyProjectCommand, createProjectHistory, projectHistoryReducer, type ProjectCommand } from './core/commands';
 import { createInitialProject } from './core/project/model';
+import { buildPlaylistEvents } from './core/events';
 import {
   createTransportState,
   getTransportCycleSteps,
@@ -27,6 +28,9 @@ const PANEL_IDS = [
 type PanelKey = 'channelRack' | 'pianoRoll' | 'playlist' | 'mixer' | 'browser';
 type CollapsedPanels = Record<PanelKey, boolean>;
 
+/** The visible arrangement region doubles as the playback loop: eight bars of 4/4. */
+const DEFAULT_LOOP_STEPS = 128;
+
 const PANEL_HOTKEYS: Record<string, string> = {
   '1': PANEL_IDS[0],
   '2': PANEL_IDS[1],
@@ -36,15 +40,26 @@ const PANEL_HOTKEYS: Record<string, string> = {
 };
 
 export function App() {
+  const audioEngineRef = useRef<BrowserAudioEngine | null>(null);
+  if (!audioEngineRef.current) {
+    audioEngineRef.current = new BrowserAudioEngine({
+      tempoBpm: 124,
+      timeSignature: { numerator: 4, denominator: 4 },
+      loop: { startStep: 0, endStep: DEFAULT_LOOP_STEPS },
+    });
+  }
+  const audioEngine = audioEngineRef.current;
+
   const [history, dispatchProject] = useReducer(
     projectHistoryReducer,
     undefined,
     () => createProjectHistory(createInitialProject()),
   );
   const [transport, dispatchTransport] = useReducer(transportReducer, undefined, createTransportState);
-  const [audioStatus, setAudioStatus] = useState<AudioEngineStatus>('idle');
   const [audioBusy, setAudioBusy] = useState(false);
+  const [loopEnabled, setLoopEnabled] = useState(true);
   const [appError, setAppError] = useState<AppError | null>(null);
+  const [audioState, setAudioState] = useState<AudioEngineState>(() => audioEngine.getState());
   const [selectedChannelId, setSelectedChannelId] = useState('channel-bass');
   const [collapsed, setCollapsed] = useState<CollapsedPanels>({
     channelRack: false,
@@ -53,10 +68,6 @@ export function App() {
     mixer: false,
     browser: false,
   });
-  const audioEngineRef = useRef<BrowserAudioEngine | null>(null);
-  if (!audioEngineRef.current) audioEngineRef.current = new BrowserAudioEngine();
-  const audioEngine = audioEngineRef.current;
-
   const project = history.project;
   const pattern = project.patterns[0];
   const activeChannelId = project.channels.some((channel) => channel.id === selectedChannelId)
@@ -67,15 +78,60 @@ export function App() {
     if (selectedChannelId !== activeChannelId) setSelectedChannelId(activeChannelId);
   }, [activeChannelId, selectedChannelId]);
 
+  // Keep the engine in step with the project: tempo, signature, loop region, and musical events.
+  useEffect(() => {
+    const cycleSteps = getTransportCycleSteps(project.settings.timeSignature);
+    const events = buildPlaylistEvents(project, {
+      timeSignature: project.settings.timeSignature,
+      endStep: cycleSteps,
+    });
+    audioEngine.setTempo(project.settings.tempo);
+    audioEngine.setTimeSignature(project.settings.timeSignature);
+    audioEngine.setLoop({ enabled: loopEnabled, startStep: 0, endStep: cycleSteps });
+    audioEngine.setSequence(events);
+  }, [audioEngine, loopEnabled, project]);
+
+  useEffect(
+    () =>
+      audioEngine.subscribe((state) => {
+        setAudioState(state);
+        // The engine can stop itself (for example at the end of a non-looping region).
+        if (state.transportStatus === 'stopped') dispatchTransport({ type: 'stop' });
+        const message = state.message;
+        if (message) {
+          setAppError((current) => (current?.message === message ? current : { source: 'audio', message }));
+        }
+      }),
+    [audioEngine],
+  );
+
+  // The playhead follows the audio clock; rendering never decides when a sound happens.
   useEffect(() => {
     if (transport.status !== 'playing') return undefined;
-    const sixteenthNoteMs = 60_000 / (project.settings.tempo * 4);
     const cycleSteps = getTransportCycleSteps(project.settings.timeSignature);
-    const timer = window.setInterval(() => {
-      dispatchTransport({ type: 'tick', cycleSteps });
-    }, sixteenthNoteMs);
-    return () => window.clearInterval(timer);
-  }, [project.settings.tempo, project.settings.timeSignature, transport.status]);
+
+    if (audioState.status !== 'ready') {
+      // No runnable audio context: keep the visual transport preview from phase one.
+      const sixteenthNoteMs = 60_000 / (project.settings.tempo * 4);
+      const timer = window.setInterval(() => {
+        dispatchTransport({ type: 'tick', cycleSteps });
+      }, sixteenthNoteMs);
+      return () => window.clearInterval(timer);
+    }
+
+    let frame = 0;
+    let lastStep = -1;
+    const draw = () => {
+      const step = Math.floor(audioEngine.getPlayheadSteps());
+      if (step !== lastStep) {
+        lastStep = step;
+        dispatchTransport({ type: 'position', positionStep: step, cycleSteps });
+      }
+      frame = window.requestAnimationFrame(draw);
+    };
+    frame = window.requestAnimationFrame(draw);
+    return () => window.cancelAnimationFrame(frame);
+  }, [audioEngine, audioState.status, project.settings.tempo, project.settings.timeSignature, transport.status]);
 
   useEffect(() => () => {
     void audioEngine.dispose().catch((error: unknown) => {
@@ -108,19 +164,60 @@ export function App() {
     setAppError(null);
   }
 
-  function handlePlayPause() {
-    dispatchTransport({ type: transport.status === 'playing' ? 'pause' : 'play' });
+  async function handlePlayPause() {
+    if (transport.status === 'playing') {
+      audioEngine.pause();
+      dispatchTransport({ type: 'pause' });
+      return;
+    }
+    // Called straight from a click or key press, so the audio context may be created here.
+    try {
+      await audioEngine.play();
+      setAppError(null);
+    } catch (error) {
+      reportError('audio', error);
+    }
+    // The visual transport keeps working even when audio is unavailable.
+    dispatchTransport({ type: 'play' });
   }
 
   function handleStop() {
+    audioEngine.stop();
     dispatchTransport({ type: 'stop' });
+  }
+
+  const handleSeek = useCallback(
+    (step: number) => {
+      audioEngine.seek(step);
+      dispatchTransport({
+        type: 'position',
+        positionStep: step,
+        cycleSteps: getTransportCycleSteps(project.settings.timeSignature),
+      });
+    },
+    [audioEngine, project.settings.timeSignature],
+  );
+
+  function handleToggleLoop() {
+    setLoopEnabled((current) => !current);
+  }
+
+  async function handleTestTone() {
+    setAudioBusy(true);
+    try {
+      await audioEngine.auditionTestTone();
+      setAppError(null);
+    } catch (error) {
+      reportError('audio', error);
+    } finally {
+      setAudioBusy(false);
+    }
   }
 
   async function handleEnableAudio() {
     setAudioBusy(true);
     try {
       const status = await audioEngine.initialize();
-      setAudioStatus(status);
       if (status === 'unsupported') {
         reportError('audio', new Error('This browser does not provide the Web Audio API.'));
       } else {
@@ -165,7 +262,7 @@ export function App() {
       const isInteractive = Boolean(target?.closest('button, a, [role="button"]'));
       if (event.code === 'Space' && !isInteractive) {
         event.preventDefault();
-        handlePlayPause();
+        void handlePlayPause();
       } else if (event.key === 'Escape') {
         handleStop();
       }
@@ -186,13 +283,18 @@ export function App() {
     <div className="app-shell">
       <TransportBar
         audioBusy={audioBusy}
-        audioStatus={audioStatus}
+        audioState={audioState}
+        cycleSteps={getTransportCycleSteps(project.settings.timeSignature)}
         history={history}
+        loopEnabled={loopEnabled}
         onCommand={handleCommand}
         onEnableAudio={handleEnableAudio}
         onPlayPause={handlePlayPause}
         onRedo={handleRedo}
+        onSeek={handleSeek}
         onStop={handleStop}
+        onTestTone={handleTestTone}
+        onToggleLoop={handleToggleLoop}
         onUndo={handleUndo}
         project={project}
         transport={transport}
@@ -209,7 +311,7 @@ export function App() {
             </div>
             <div className="foundation-notice">
               <span className="foundation-dot" />
-              <span>Pattern editing active · audio playback not implemented</span>
+              <span>Pattern editing active · scheduled audio engine online</span>
             </div>
           </div>
 
