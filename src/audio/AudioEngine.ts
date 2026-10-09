@@ -579,6 +579,29 @@ export class BrowserAudioEngine implements AudioEngine, MusicalEventSink {
     this.emit();
   }
 
+  /** Preview a pitched note on an instrument channel without starting the transport. */
+  async auditionNote(channelId: string, pitch: number, velocity = 0.8, durationSeconds = 0.18): Promise<void> {
+    const context = await this.ensureContext();
+    const time = context.currentTime + 0.02;
+    const safePitch = Math.min(127, Math.max(0, Math.round(pitch)));
+    const safeVelocity = Math.min(1, Math.max(0, velocity));
+    this.scheduleEvent({
+      event: {
+        kind: 'note',
+        id: `audition-note:${channelId}:${safePitch}:${time}`,
+        step: 0,
+        channelId,
+        pitch: safePitch,
+        velocity: safeVelocity,
+        durationSteps: 1,
+      },
+      time,
+      durationSeconds: Math.max(0.05, durationSeconds),
+      iteration: 0,
+    });
+    this.emit();
+  }
+
   private handleContextStateChange(): void {
     const context = this.context;
     if (!context) return;
