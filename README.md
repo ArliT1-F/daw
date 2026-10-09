@@ -123,7 +123,7 @@ graph down, and an `interrupted` context (iOS/Safari) pauses transport and repor
 npm test
 ```
 
-108 tests cover the audio and editing layers:
+112 tests cover the audio and editing layers:
 
 - `src/core/time` — grid maths, tempo-map integration and inversion, bar/beat/sixteenth
   round-trips, odd signatures (6/8, 7/8, 12/8), clamping, and formatting.
@@ -142,6 +142,8 @@ npm test
   `AudioContext` double (`src/audio/__fixtures__`), so no browser is required.
 - `src/audio/voices` — voice construction, envelopes, pool cancellation and release.
 - `src/audio/timer` — interval timer behaviour and the worker fallback.
+- `src/App.audio.test.tsx` — the React wiring in a DOM: mounting never touches audio, play
+  schedules voices, stop releases them, and the loop toggle and test tone work.
 
 ## Current limits
 
