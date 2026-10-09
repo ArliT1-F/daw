@@ -115,14 +115,18 @@ export class FakeDynamicsCompressorNode extends FakeAudioNode {
 }
 
 export class FakeAudioBuffer {
-  private readonly channels: Float32Array[];
+  private readonly channels: Float32Array[] = [];
 
   constructor(
     readonly numberOfChannels: number,
     readonly length: number,
     readonly sampleRate: number,
   ) {
-    this.channels = Array.from({ length: numberOfChannels }, () => new Float32Array(length));
+    for (let index = 0; index < numberOfChannels; index += 1) this.channels.push(new Float32Array(length));
+  }
+
+  get duration(): number {
+    return this.length / this.sampleRate;
   }
 
   getChannelData(channel: number): Float32Array {
@@ -154,10 +158,24 @@ export class FakeAudioContext {
   closeCount = 0;
   /** Next resume() rejects with a NotAllowedError, as an autoplay block would. */
   failNextResume = false;
+  /** Next decodeAudioData() rejects, as an unsupported codec would. */
+  failNextDecode = false;
+  decodeCount = 0;
 
   constructor(options: FakeContextOptions = {}) {
     this.sampleRate = options.sampleRate ?? 48000;
     if (options.startRunning) this.state = 'running';
+  }
+
+  async decodeAudioData(_data: ArrayBuffer): Promise<FakeAudioBuffer> {
+    this.decodeCount += 1;
+    if (this.failNextDecode) {
+      this.failNextDecode = false;
+      const error = new Error('The encoded audio data is not supported.');
+      error.name = 'EncodingError';
+      throw error;
+    }
+    return new FakeAudioBuffer(1, Math.round(this.sampleRate * 0.25), this.sampleRate);
   }
 
   get sources(): FakeAudioSourceNode[] {

@@ -32,10 +32,10 @@ npm run preview   # serve the production build locally
 - `src/core/time` — the musical time model: the sixteenth-note grid, bars/beats/subdivisions, and a tempo map that converts between step positions and seconds.
 - `src/core/events` — musical event data (sample triggers, sustained notes) plus the pure translation from project data to a playable event list.
 - `src/core/transport` — UI transport state and `TransportClock`, the single authority that maps audio-clock time to musical position.
-- `src/audio` — `BrowserAudioEngine` (context lifecycle, audio graph, voices), the lookahead `Scheduler`, and the lookahead timer.
-- `src/features` — focused UI modules for the transport, Channel Rack, Piano Roll, Playlist, Mixer, and asset browser.
+- `src/audio` — `BrowserAudioEngine` (context lifecycle, audio graph, voices), the lookahead `Scheduler`, the lookahead timer, and the `SampleStore` (runtime registry for decoded user samples; buffers never enter the project document).
+- `src/features` — focused UI modules for the transport, Channel Rack (step sequencer), Piano Roll, Playlist, Mixer, and asset browser.
 
-Project content, transient panel/selection state, transport position, persistence, and browser audio objects are kept in separate layers. Pattern steps, piano-roll notes, tempo, time signature, and arrangement clips are editable and undoable. The starter project is currently held in memory only.
+Project content, transient panel/selection state, transport position, persistence, and browser audio objects are kept in separate layers. Pattern steps with per-step velocities, piano-roll notes, tempo, swing, time signature, channel mute/solo/sample assignments, and arrangement clips are all serializable project data edited through undoable commands. The starter project is currently held in memory only.
 
 ## Audio engine
 
@@ -145,11 +145,29 @@ npm test
 - `src/App.audio.test.tsx` — the React wiring in a DOM: mounting never touches audio, play
   schedules voices, stop releases them, and the loop toggle and test tone work.
 
+## Channel Rack
+
+The Channel Rack is a real step sequencer wired to the scheduler:
+
+- 16/32-step patterns with per-step toggling and per-step velocity (click/wheel/arrow keys, plus a
+  dedicated velocity painting mode for touch), pattern add/duplicate/rename/clear and selection.
+- BPM (transport bar) and swing (rack) are project settings; every event is quantized to the
+  sixteenth-note grid and scheduled on the audio clock, so tempo changes re-anchor playback
+  without drift.
+- Channel mute/solo are applied when project events are built, so activity lights and the step
+  playhead always reflect the events the scheduler actually queues — indicators only move while
+  the engine is genuinely playing.
+- User samples load per channel through the file picker or drag-and-drop (WAV/MP3/OGG/FLAC/M4A
+  and other `audio/*` types the browser can decode), with visible loading and per-row error states;
+  a preview button auditions the channel. Decoded buffers live in the runtime `SampleStore`, keyed
+  by a stable `sampleId` stored on the channel.
+
 ## Current limits
 
-The engine plays the starter kit, but it is not a complete instrument: the drum kit and synth are
-synthesised placeholders (no sample assets, no sampler), channels have no inserts, and the mixer
-has no faders. Master metering, IndexedDB persistence, project import/export, effects, and plugin
-hosting remain deferred and labeled in the UI. Drum lanes trigger samples from the Channel Rack
+The engine plays the starter kit plus user-loaded samples: the built-in drum kit and synth are
+synthesised placeholders (no bundled sample assets), channels have no inserts, and the mixer has
+no faders. Loaded samples are session-only (buffers are not persisted with the project file yet).
+Master metering, IndexedDB persistence, project import/export, effects, and plugin hosting remain
+deferred and labeled in the UI. Drum lanes and sample-loaded lanes trigger from the Channel Rack
 step grid; instrument lanes play piano-roll notes. No external fonts, assets, or network services
 are required.

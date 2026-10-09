@@ -66,8 +66,15 @@ export function PianoRoll({
       toolbar={toolbar}
     >
       <div className="piano-roll-scroll">
-        <div className="piano-grid">
-          <div aria-hidden="true" className="piano-ruler-row">
+        <div
+          className="piano-grid"
+          style={{ minWidth: `calc(40px + ${pattern.lengthSteps} * (var(--step-min, 18px) + 2px))` }}
+        >
+          <div
+            aria-hidden="true"
+            className="piano-ruler-row"
+            style={{ gridTemplateColumns: `40px repeat(${pattern.lengthSteps}, minmax(var(--step-min, 18px), 1fr))` }}
+          >
             <span className="piano-key-heading">PITCH</span>
             {Array.from({ length: pattern.lengthSteps }, (_, index) => (
               <span className={index % 4 === 0 ? 'piano-ruler-beat' : ''} key={index}>
@@ -80,7 +87,11 @@ export function PianoRoll({
             const isC = pitch % 12 === 0;
             const isBlackKey = [1, 3, 6, 8, 10].includes(pitch % 12);
             return (
-              <div className={`piano-row ${isC ? 'piano-row--c' : ''}`} key={pitch}>
+              <div
+                className={`piano-row ${isC ? 'piano-row--c' : ''}`}
+                key={pitch}
+                style={{ gridTemplateColumns: `40px repeat(${pattern.lengthSteps}, minmax(var(--step-min, 18px), 1fr))` }}
+              >
                 <span className={`piano-key ${isBlackKey ? 'piano-key--black' : ''} ${isC ? 'piano-key--c' : ''}`}>
                   {label}
                 </span>

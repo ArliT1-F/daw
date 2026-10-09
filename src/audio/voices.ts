@@ -34,6 +34,9 @@ interface VoiceParts {
 
 export type DrumVoiceId = 'kick' | 'snare' | 'hat' | 'perc';
 
+/** Resolves a sample id to a decoded buffer, or null when the id has no loaded asset. */
+export type SampleResolver = (sampleId: string) => AudioBuffer | null;
+
 /** Resolve a sample id to a built-in voice. Starter channels map to the drum kit. */
 export function resolveDrumVoice(sampleId: string): DrumVoiceId {
   const id = sampleId.toLowerCase();
@@ -134,12 +137,16 @@ export function createVoice(
   timing: ScheduledEventTiming,
   graph: AudioGraph,
   onEnded: (voice: Voice) => void,
+  resolveSample?: SampleResolver,
 ): Voice | null {
   const { event, time } = timing;
   const destination = graph.getChannelBus(event.channelId);
+  const buffer = event.kind === 'sample' ? resolveSample?.(event.sampleId) : null;
   const parts =
     event.kind === 'sample'
-      ? createDrumParts(graph, event.sampleId, time, event.velocity, destination)
+      ? buffer
+        ? createSampleParts(graph, buffer, time, event.velocity, destination)
+        : createDrumParts(graph, event.sampleId, time, event.velocity, destination)
       : event.kind === 'note'
         ? createSynthParts(graph, event.pitch, time, timing.durationSeconds, event.velocity, destination)
         : null;
@@ -190,6 +197,7 @@ export class VoicePool {
   constructor(
     private readonly graph: AudioGraph,
     private readonly onError?: (error: unknown) => void,
+    private readonly resolveSample?: SampleResolver,
   ) {}
 
   get activeCount(): number {
@@ -203,9 +211,14 @@ export class VoicePool {
 
   schedule(timing: ScheduledEventTiming): void {
     try {
-      const voice = createVoice(timing, this.graph, (ended) => {
-        this.voices.delete(ended);
-      });
+      const voice = createVoice(
+        timing,
+        this.graph,
+        (ended) => {
+          this.voices.delete(ended);
+        },
+        this.resolveSample,
+      );
       if (voice) this.voices.add(voice);
     } catch (error) {
       this.onError?.(error);
@@ -249,6 +262,33 @@ function createDrumParts(
     default:
       return createPerc(graph, time, velocity, destination);
   }
+}
+
+/** One-shot playback of a decoded sample buffer, shaped by the step velocity. */
+function createSampleParts(
+  graph: AudioGraph,
+  buffer: AudioBuffer,
+  time: number,
+  velocity: number,
+  destination: AudioNode,
+): VoiceParts {
+  const context = graph.context;
+  const source = context.createBufferSource();
+  const gain = context.createGain();
+  const peak = Math.max(SILENCE * 2, Math.min(1, velocity));
+  const duration = Math.max(0.02, buffer.duration);
+  const endTime = time + duration;
+  const release = Math.min(0.012, duration / 2);
+
+  source.buffer = buffer;
+  gain.gain.setValueAtTime(SILENCE, time);
+  gain.gain.exponentialRampToValueAtTime(peak, time + Math.min(0.003, duration / 4));
+  gain.gain.setValueAtTime(peak, endTime - release);
+  gain.gain.exponentialRampToValueAtTime(SILENCE, endTime);
+
+  source.connect(gain);
+  gain.connect(destination);
+  return { sources: [source], gains: [gain], endTime };
 }
 
 function createKick(graph: AudioGraph, time: number, velocity: number, destination: AudioNode): VoiceParts {

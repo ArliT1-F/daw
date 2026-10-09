@@ -12,10 +12,12 @@ export type MusicalEventKind = 'sample' | 'note';
 export interface SampleTriggerEvent {
   readonly kind: 'sample';
   readonly id: string;
-  /** Position within the loop, in sixteenth-note steps. */
+  /** Position within the loop, in sixteenth-note steps (fractional when swung). */
   readonly step: number;
+  /** Pattern this event came from, when it was built from project data. */
+  readonly patternId?: string;
   readonly channelId: string;
-  /** Sample asset id. The starter kit resolves this to a synthesized placeholder voice. */
+  /** Sample asset id. Falls back to a synthesized placeholder voice when unloaded. */
   readonly sampleId: string;
   /** 0..1 */
   readonly velocity: number;
@@ -25,7 +27,9 @@ export interface SampleTriggerEvent {
 export interface NoteEvent {
   readonly kind: 'note';
   readonly id: string;
+  /** Fractional when swung. */
   readonly step: number;
+  readonly patternId?: string;
   readonly channelId: string;
   /** MIDI note number, 0..127. */
   readonly pitch: number;

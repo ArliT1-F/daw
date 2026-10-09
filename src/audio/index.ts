@@ -25,8 +25,20 @@ export {
   resolveDrumVoice,
   VOICE_RELEASE_SECONDS,
   type DrumVoiceId,
+  type SampleResolver,
   type Voice,
 } from './voices';
+export {
+  MAX_SAMPLE_BYTES,
+  SampleLoadError,
+  SampleStore,
+  SUPPORTED_SAMPLE_EXTENSIONS,
+  isSupportedAudioFile,
+  loadSampleFile,
+  type LoadedSample,
+  type SampleDecodeFunction,
+  type SampleFile,
+} from './sampleStore';
 export {
   createBestAvailableTimer,
   createIntervalTimer,
