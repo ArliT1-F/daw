@@ -75,6 +75,11 @@ export class FakeAudioSourceNode extends FakeAudioNode {
   }
 
   stop(time = 0): void {
+    if (this.startedAt === null) {
+      const error = new Error("Failed to execute 'stop' on 'AudioScheduledSourceNode': cannot call stop without calling start first.");
+      error.name = 'InvalidStateError';
+      throw error;
+    }
     this.stopAt = time;
   }
 }
