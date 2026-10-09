@@ -10,6 +10,7 @@ import {
   type TimeSignature,
   isValidTimeSignature,
 } from '../project/model';
+import { patternLengthTicks } from '../time/ticks';
 
 export type ProjectCommand =
   | { type: 'project.tempo.set'; tempo: number }
@@ -29,6 +30,10 @@ export type ProjectCommand =
   | { type: 'pattern.step.toggle'; patternId: string; channelId: string; step: number }
   | { type: 'pattern.step.set'; patternId: string; channelId: string; step: number; active: boolean; velocity?: number }
   | { type: 'pattern.note.toggle'; patternId: string; channelId: string; note: Note }
+  | { type: 'pattern.note.add'; patternId: string; channelId: string; note: Note }
+  | { type: 'pattern.note.remove'; patternId: string; channelId: string; noteId: string }
+  | { type: 'pattern.note.update'; patternId: string; channelId: string; noteId: string; changes: Partial<Omit<Note, 'id'>> }
+  | { type: 'pattern.notes.replace'; patternId: string; channelId: string; notes: Note[] }
   | { type: 'playlist.clip.add'; clip: PlaylistClip }
   | { type: 'playlist.clip.remove'; clipId: string };
 
@@ -111,19 +116,51 @@ function validateNote(pattern: Pattern, note: Note): void {
   if (!Number.isInteger(note.pitch) || note.pitch < 0 || note.pitch > 127) {
     throw new ProjectCommandError('Note pitch must be a MIDI note from 0 to 127.');
   }
+  const lengthTicks = patternLengthTicks(pattern.lengthSteps);
   if (
-    !Number.isInteger(note.startStep) ||
-    note.startStep < 0 ||
-    note.startStep >= pattern.lengthSteps ||
-    !Number.isInteger(note.durationSteps) ||
-    note.durationSteps < 1 ||
-    note.startStep + note.durationSteps > pattern.lengthSteps
+    !Number.isInteger(note.startTick) ||
+    note.startTick < 0 ||
+    note.startTick >= lengthTicks ||
+    !Number.isInteger(note.durationTicks) ||
+    note.durationTicks < 1 ||
+    note.startTick + note.durationTicks > lengthTicks
   ) {
     throw new ProjectCommandError('Note position or length is outside the pattern.');
   }
   if (!Number.isFinite(note.velocity) || note.velocity < 0 || note.velocity > 1) {
     throw new ProjectCommandError('Note velocity must be between 0 and 1.');
   }
+}
+
+function notesAreEqual(a: readonly Note[], b: readonly Note[]): boolean {
+  if (a.length !== b.length) return false;
+  for (let index = 0; index < a.length; index += 1) {
+    const left = a[index];
+    const right = b[index];
+    if (
+      left.id !== right.id ||
+      left.pitch !== right.pitch ||
+      left.startTick !== right.startTick ||
+      left.durationTicks !== right.durationTicks ||
+      left.velocity !== right.velocity
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function requireNoteLane(pattern: Pattern, channelId: string): Note[] {
+  const currentNotes = pattern.notes[channelId];
+  if (!currentNotes) throw new ProjectCommandError('The pattern has no note lane for this channel.');
+  return currentNotes;
+}
+
+function replaceNoteLane(project: Project, patternId: string, channelId: string, notes: Note[]): Project {
+  return updatePattern(project, patternId, (current) => ({
+    ...current,
+    notes: { ...current.notes, [channelId]: notes.map((note) => ({ ...note })) },
+  }));
 }
 
 /** Apply one project edit immutably. The same command can be replayed after undo. */
@@ -176,6 +213,7 @@ export function applyProjectCommand(project: Project, command: ProjectCommand): 
       const patterns = project.patterns.map((pattern) => ({
         ...pattern,
         steps: { ...pattern.steps, [channel.id]: Array.from({ length: pattern.lengthSteps }, () => false) },
+        velocities: { ...pattern.velocities, [channel.id]: Array.from({ length: pattern.lengthSteps }, () => DEFAULT_STEP_VELOCITY) },
         notes: { ...pattern.notes, [channel.id]: [] },
       }));
       return { ...project, channels, patterns };
@@ -332,9 +370,10 @@ export function applyProjectCommand(project: Project, command: ProjectCommand): 
         steps[channel.id] = Array.from({ length }, (_, index) => row[index] ?? false);
         const velocityRow = pattern.velocities[channel.id] ?? [];
         velocities[channel.id] = Array.from({ length }, (_, index) => velocityRow[index] ?? DEFAULT_STEP_VELOCITY);
+        const lengthTicks = patternLengthTicks(length);
         notes[channel.id] = (pattern.notes[channel.id] ?? [])
-          .filter((note) => note.startStep < length)
-          .map((note) => ({ ...note, durationSteps: Math.min(note.durationSteps, length - note.startStep) }));
+          .filter((note) => note.startTick < lengthTicks)
+          .map((note) => ({ ...note, durationTicks: Math.min(note.durationTicks, lengthTicks - note.startTick) }));
       }
       return updatePattern(project, command.patternId, (current) => ({
         ...current,
@@ -369,18 +408,69 @@ export function applyProjectCommand(project: Project, command: ProjectCommand): 
       requireChannel(project, command.channelId);
       const pattern = requirePattern(project, command.patternId);
       validateNote(pattern, command.note);
-      const currentNotes = pattern.notes[command.channelId];
-      if (!currentNotes) throw new ProjectCommandError('The pattern has no note lane for this channel.');
+      const currentNotes = requireNoteLane(pattern, command.channelId);
       const exists = currentNotes.some((note) => note.id === command.note.id);
-      return updatePattern(project, command.patternId, (current) => ({
-        ...current,
-        notes: {
-          ...current.notes,
-          [command.channelId]: exists
-            ? currentNotes.filter((note) => note.id !== command.note.id)
-            : [...currentNotes, { ...command.note }],
-        },
-      }));
+      return replaceNoteLane(
+        project,
+        command.patternId,
+        command.channelId,
+        exists ? currentNotes.filter((note) => note.id !== command.note.id) : [...currentNotes, command.note],
+      );
+    }
+
+    case 'pattern.note.add': {
+      requireChannel(project, command.channelId);
+      const pattern = requirePattern(project, command.patternId);
+      validateNote(pattern, command.note);
+      const currentNotes = requireNoteLane(pattern, command.channelId);
+      if (currentNotes.some((note) => note.id === command.note.id)) {
+        throw new ProjectCommandError('Note IDs must be unique.');
+      }
+      return replaceNoteLane(project, command.patternId, command.channelId, [...currentNotes, command.note]);
+    }
+
+    case 'pattern.note.remove': {
+      requireChannel(project, command.channelId);
+      const pattern = requirePattern(project, command.patternId);
+      const currentNotes = requireNoteLane(pattern, command.channelId);
+      const nextNotes = currentNotes.filter((note) => note.id !== command.noteId);
+      if (nextNotes.length === currentNotes.length) return project;
+      return replaceNoteLane(project, command.patternId, command.channelId, nextNotes);
+    }
+
+    case 'pattern.note.update': {
+      requireChannel(project, command.channelId);
+      const pattern = requirePattern(project, command.patternId);
+      const currentNotes = requireNoteLane(pattern, command.channelId);
+      const index = currentNotes.findIndex((note) => note.id === command.noteId);
+      if (index < 0) throw new ProjectCommandError('Note does not exist.');
+      const updated: Note = { ...currentNotes[index], ...command.changes, id: currentNotes[index].id };
+      validateNote(pattern, updated);
+      if (
+        updated.pitch === currentNotes[index].pitch &&
+        updated.startTick === currentNotes[index].startTick &&
+        updated.durationTicks === currentNotes[index].durationTicks &&
+        updated.velocity === currentNotes[index].velocity
+      ) {
+        return project;
+      }
+      const nextNotes = [...currentNotes];
+      nextNotes[index] = updated;
+      return replaceNoteLane(project, command.patternId, command.channelId, nextNotes);
+    }
+
+    case 'pattern.notes.replace': {
+      requireChannel(project, command.channelId);
+      const pattern = requirePattern(project, command.patternId);
+      requireNoteLane(pattern, command.channelId);
+      const seen = new Set<string>();
+      for (const note of command.notes) {
+        validateNote(pattern, note);
+        if (seen.has(note.id)) throw new ProjectCommandError('Note IDs must be unique.');
+        seen.add(note.id);
+      }
+      if (notesAreEqual(pattern.notes[command.channelId] ?? [], command.notes)) return project;
+      return replaceNoteLane(project, command.patternId, command.channelId, command.notes);
     }
 
     case 'playlist.clip.add': {

@@ -1,4 +1,5 @@
 import { barsToSteps, stepsPerBeat } from '../time/musicalTime';
+import { ticksToSteps } from '../time/ticks';
 import { DEFAULT_STEP_VELOCITY, type Project, type TimeSignature } from '../project/model';
 import { sortMusicalEvents, type MusicalEvent, type NoteEvent, type SampleTriggerEvent } from './musicalEvents';
 
@@ -112,7 +113,15 @@ export function buildPlaylistEvents(project: Project, options: SequenceBuildOpti
         const notes = pattern.notes[channel.id];
         if (notes) {
           for (const note of notes) {
-            const gridStep = baseStep + note.startStep;
+            const startSteps = ticksToSteps(note.startTick);
+            const durationSteps = ticksToSteps(Math.max(1, note.durationTicks));
+            const gridStep = baseStep + startSteps;
+            const regionEnd = Math.min(clipEndStep, endStep);
+            if (gridStep < clipStartStep || gridStep >= regionEnd) continue;
+            // Notes that cross a clip or loop end are truncated; they do not wrap.
+            const available = regionEnd - gridStep;
+            const scheduledDuration = Math.min(durationSteps, available);
+            if (scheduledDuration <= 0) continue;
             const event: NoteEvent = {
               kind: 'note',
               id: `${clip.id}:${offset}:${note.id}`,
@@ -121,11 +130,9 @@ export function buildPlaylistEvents(project: Project, options: SequenceBuildOpti
               channelId: channel.id,
               pitch: note.pitch,
               velocity: clipVelocity(note.velocity),
-              durationSteps: Math.max(1, note.durationSteps),
+              durationSteps: scheduledDuration,
             };
-            if (gridStep >= clipStartStep && gridStep < Math.min(clipEndStep, endStep)) {
-              events.push({ ...event, step: gridStep + swingOffset(gridStep) });
-            }
+            events.push({ ...event, step: gridStep + swingOffset(gridStep) });
           }
         }
       }

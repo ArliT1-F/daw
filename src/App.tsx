@@ -407,10 +407,20 @@ export function App() {
           <div className="middle-panels">
             <PianoRoll
               collapsed={collapsed.pianoRoll}
+              getPlayheadSteps={() => audioEngine.getPlayheadSteps()}
               onCommand={handleCommand}
+              onPreviewNote={(pitch, velocity) => {
+                const current = project.channels.find((item) => item.id === activeChannelId);
+                if (!current || current.kind !== 'instrument') return;
+                void audioEngine.auditionNote(activeChannelId, pitch, velocity).catch((error: unknown) => {
+                  reportError('audio', error);
+                });
+              }}
+              onSeek={handleSeek}
               onSelectChannel={setSelectedChannelId}
               onToggle={() => togglePanel('pianoRoll')}
               pattern={pattern}
+              playbackActive={audioState.transportStatus === 'playing'}
               project={project}
               selectedChannelId={activeChannelId}
               transport={transport}

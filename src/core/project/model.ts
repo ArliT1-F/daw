@@ -1,3 +1,5 @@
+import { TICKS_PER_STEP } from '../time/ticks';
+
 export const PROJECT_FORMAT = 'gridline-project' as const;
 export const PROJECT_VERSION = 1 as const;
 export const DEFAULT_PATTERN_STEPS = 16;
@@ -41,9 +43,16 @@ export interface Channel {
 
 export interface Note {
   id: string;
+  /** MIDI note number, 0..127. */
   pitch: number;
-  startStep: number;
-  durationSteps: number;
+  /**
+   * Start position in integer ticks from the beginning of the pattern.
+   * Canonical timing unit — see `src/core/time/ticks.ts`.
+   */
+  startTick: number;
+  /** Length in integer ticks. */
+  durationTicks: number;
+  /** 0..1 */
   velocity: number;
 }
 
@@ -210,8 +219,14 @@ export function assertValidProject(value: unknown): asserts value is Project {
         ensure(isRecord(note), 'Note data must be an object.');
         ensure(typeof note.id === 'string' && note.id.trim().length > 0, 'Note ID is missing.');
         ensure(Number.isInteger(note.pitch) && Number(note.pitch) >= 0 && Number(note.pitch) <= 127, 'Note pitch is invalid.');
-        ensure(Number.isInteger(note.startStep) && Number(note.startStep) >= 0 && Number(note.startStep) < Number(pattern.lengthSteps), 'Note start position is invalid.');
-        ensure(Number.isInteger(note.durationSteps) && Number(note.durationSteps) >= 1 && Number(note.startStep) + Number(note.durationSteps) <= Number(pattern.lengthSteps), 'Note duration is invalid.');
+        const lengthTicks = Number(pattern.lengthSteps) * TICKS_PER_STEP;
+        ensure(Number.isInteger(note.startTick) && Number(note.startTick) >= 0 && Number(note.startTick) < lengthTicks, 'Note start position is invalid.');
+        ensure(
+          Number.isInteger(note.durationTicks) &&
+            Number(note.durationTicks) >= 1 &&
+            Number(note.startTick) + Number(note.durationTicks) <= lengthTicks,
+          'Note duration is invalid.',
+        );
         ensure(Number.isFinite(note.velocity) && Number(note.velocity) >= 0 && Number(note.velocity) <= 1, 'Note velocity must be from 0 to 1.');
       }
       ensureUniqueIds(notes as Array<{ id: string }>, 'Note');
@@ -250,10 +265,10 @@ export function createInitialProject(): Project {
   ];
   const notes: Record<string, Note[]> = Object.fromEntries(channels.map((channel) => [channel.id, []]));
   notes['channel-bass'] = [
-    { id: 'note-bass-1', pitch: 60, startStep: 0, durationSteps: 4, velocity: 0.82 },
-    { id: 'note-bass-2', pitch: 67, startStep: 4, durationSteps: 2, velocity: 0.72 },
-    { id: 'note-bass-3', pitch: 62, startStep: 8, durationSteps: 4, velocity: 0.78 },
-    { id: 'note-bass-4', pitch: 65, startStep: 12, durationSteps: 4, velocity: 0.72 },
+    { id: 'note-bass-1', pitch: 60, startTick: 0, durationTicks: 96, velocity: 0.82 },
+    { id: 'note-bass-2', pitch: 67, startTick: 96, durationTicks: 48, velocity: 0.72 },
+    { id: 'note-bass-3', pitch: 62, startTick: 192, durationTicks: 96, velocity: 0.78 },
+    { id: 'note-bass-4', pitch: 65, startTick: 288, durationTicks: 96, velocity: 0.72 },
   ];
 
   const project: Project = {

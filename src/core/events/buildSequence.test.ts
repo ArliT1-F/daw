@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { createInitialProject, type Note, type Project } from '../project/model';
 import { buildPlaylistEvents, getSequenceEndStep } from './buildSequence';
 import { firstEventIndexAtOrAfter, sortMusicalEvents, type MusicalEvent } from './musicalEvents';
+import { TICKS_PER_STEP, ticksToSeconds } from '../time';
 
 const FOUR_FOUR = { numerator: 4, denominator: 4 };
 const SIX_EIGHT = { numerator: 6, denominator: 8 };
@@ -92,6 +93,29 @@ describe('playlist event building', () => {
     const events = build(createInitialProject());
     expect(getSequenceEndStep(events)).toBe(64);
     expect(getSequenceEndStep([])).toBe(0);
+  });
+
+  it('converts integer ticks into scheduler steps, including 32nd notes', () => {
+    const project = createInitialProject();
+    project.patterns[0].notes['channel-bass'] = [
+      { id: 'n-32', pitch: 60, startTick: 12, durationTicks: 12, velocity: 0.9 },
+    ];
+    const events = build(project).filter((event) => event.kind === 'note' && event.id.includes('n-32'));
+    expect(events[0]).toMatchObject({ step: 0.5, durationSteps: 0.5, pitch: 60 });
+    // 120 BPM in 4/4: 12 ticks (one 32nd) last 0.0625 s.
+    expect(ticksToSeconds(12, 120, FOUR_FOUR)).toBeCloseTo(0.0625, 12);
+  });
+
+  it('truncates notes that cross a clip or loop boundary instead of wrapping them', () => {
+    const project = createInitialProject();
+    project.playlist = [{ id: 'clip-a', patternId: 'pattern-main', startBar: 0, lengthBars: 1 }];
+    project.patterns[0].notes['channel-bass'] = [
+      { id: 'n-edge', pitch: 60, startTick: 14 * TICKS_PER_STEP, durationTicks: 4 * TICKS_PER_STEP, velocity: 0.8 },
+    ];
+    const events = build(project, { endStep: 16 }).filter((event) => event.kind === 'note');
+    expect(events).toHaveLength(1);
+    expect(events[0].step).toBe(14);
+    expect(events[0].kind === 'note' && events[0].durationSteps).toBe(2);
   });
 
   it('clamps velocity into 0..1', () => {

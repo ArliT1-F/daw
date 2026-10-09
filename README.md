@@ -111,9 +111,9 @@ graph down, and an `interrupted` context (iOS/Safari) pauses transport and repor
   dropped and the next cycle is picked up on time.
 - **Device changes.** Web Audio does not expose device selection; if the output device disappears
   the context may go to `interrupted`/`closed`, which the engine surfaces as an error.
-- **Quantisation of the visual playhead.** The UI highlights sixteenth-note steps, so the drawn
-  playhead moves in steps (~8 times per second at 124 BPM) even though the audio position is
-  continuous.
+- **Quantisation of the Channel Rack playhead.** The step sequencer highlights sixteenth-note
+  cells, so that playhead moves in steps (~8 times per second at 124 BPM) even though the audio
+  position is continuous. The piano roll draws a tick-accurate playhead from the same clock.
 - **No sample-accurate automation yet.** Tempo is constant per project (the tempo map supports
   future automation); mixer faders and effects are still deferred.
 
@@ -123,12 +123,14 @@ graph down, and an `interrupted` context (iOS/Safari) pauses transport and repor
 npm test
 ```
 
-112 tests cover the audio and editing layers:
+221 tests cover the audio and editing layers:
 
-- `src/core/time` — grid maths, tempo-map integration and inversion, bar/beat/sixteenth
-  round-trips, odd signatures (6/8, 7/8, 12/8), clamping, and formatting.
+- `src/core/time` — grid maths, integer-tick conversions (ticks ↔ steps ↔ bars/beats ↔ seconds),
+  tempo-map integration and inversion, bar/beat/sixteenth round-trips, odd signatures (6/8, 7/8,
+  12/8), snapping, loop-boundary duration, clamping, and formatting.
 - `src/core/events` — project → event translation (clip placement, pattern repeat, clip
-  truncation, sorting, unique ids, velocity clamping) and event-list helpers.
+  truncation, tick-based piano-roll notes, notes truncated at clip/loop ends, sorting, unique ids,
+  velocity clamping) and event-list helpers.
 - `src/core/transport` — `TransportClock` start/pause/resume/stop/seek, tempo and signature
   changes, loop wrapping (including many wraps drift-free and stalled clocks), cycle timing
   across a loop boundary, and snapshots.
@@ -144,6 +146,9 @@ npm test
 - `src/audio/timer` — interval timer behaviour and the worker fallback.
 - `src/App.audio.test.tsx` — the React wiring in a DOM: mounting never touches audio, play
   schedules voices, stop releases them, and the loop toggle and test tone work.
+- `src/features/piano-roll` — note create/select/delete/copy/paste, velocity, snapping,
+  serialization of integer ticks, and playhead/note alignment across tempo changes.
+- `src/core/commands/pianoRoll.test.ts` — undoable add/update/remove/replace of tick-based notes.
 
 ## Channel Rack
 
@@ -161,6 +166,23 @@ The Channel Rack is a real step sequencer wired to the scheduler:
   and other `audio/*` types the browser can decode), with visible loading and per-row error states;
   a preview button auditions the channel. Decoded buffers live in the runtime `SampleStore`, keyed
   by a stable `sampleId` stored on the channel.
+
+## Piano Roll
+
+The Piano Roll is a tick-accurate MIDI editor wired to the same project model and scheduler:
+
+- Keyboard on the vertical axis (MIDI 0–127) and a bar/beat grid on the horizontal axis, with
+  horizontal/vertical scroll, H/V zoom, and a playhead driven by the audio clock.
+- Draw and Select tools: create, select, move, resize, duplicate, multi-select (shift / marquee),
+  and delete notes. Copy/paste, quantize, and note-length presets are in the toolbar.
+- Grid snapping to straight and triplet subdivisions (including 1/64 and off / 1-tick). All note
+  positions and durations are stored as integer ticks (96 PPQ) so repeated edits cannot accumulate
+  floating-point error.
+- Velocity per note, with a dedicated velocity lane.
+- Notes that start inside a clip or loop and extend past its end are truncated at the boundary;
+  they do not wrap into the next iteration. Pattern notes themselves always lie inside the pattern.
+- Instrument channels preview pitches from the keyboard and while drawing/moving notes. The
+  built-in synth voice is the only pitched instrument; no extra instrument collection is bundled.
 
 ## Current limits
 

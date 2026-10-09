@@ -391,6 +391,15 @@ describe('audio engine playback', () => {
     expect(harness.fake.bufferSources).toHaveLength(0);
   });
 
+  it('previews a pitched instrument note without starting the transport', async () => {
+    const harness = createEngine();
+    await harness.engine.auditionNote('channel-bass', 64, 0.7);
+    expect(harness.engine.transport.status).toBe('stopped');
+    // Two detuned saws plus a sub oscillator.
+    expect(harness.fake.oscillators).toHaveLength(3);
+    expect(harness.fake.oscillators[0].startedAt).toBeCloseTo(0.02, 6);
+  });
+
   it('decodes sample files without resuming or running the transport', async () => {
     const harness = createEngine();
     const decoded = await harness.engine.decodeAudioData(new ArrayBuffer(128));
