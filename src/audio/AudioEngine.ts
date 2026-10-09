@@ -83,6 +83,8 @@ export interface BrowserAudioEngineOptions {
   tempoBpm?: number;
   timeSignature?: TimeSignature;
   loop?: Partial<LoopRange>;
+  /** Runtime lookup for decoded sample assets; never part of the project document. */
+  resolveSample?: (sampleId: string) => AudioBuffer | null;
 }
 
 const UNSUPPORTED_MESSAGE =
@@ -103,6 +105,7 @@ export class BrowserAudioEngine implements AudioEngine, MusicalEventSink {
   private readonly timer: RepeatingTimer;
   private readonly startDelaySeconds: number;
   private readonly createContext: (() => AudioContext) | undefined;
+  private readonly resolveSample: ((sampleId: string) => AudioBuffer | null) | undefined;
   private error: AudioEngineError | null = null;
   private unsupported = false;
   private disposed = false;
@@ -110,6 +113,7 @@ export class BrowserAudioEngine implements AudioEngine, MusicalEventSink {
 
   constructor(options: BrowserAudioEngineOptions = {}) {
     this.createContext = options.createContext;
+    this.resolveSample = options.resolveSample;
     this.startDelaySeconds = options.startDelaySeconds ?? 0.06;
     this.timer = options.timer ?? createBestAvailableTimer();
     this.transportClock = new TransportClock({
@@ -497,12 +501,82 @@ export class BrowserAudioEngine implements AudioEngine, MusicalEventSink {
       throw new AudioEngineError(AUTOPLAY_MESSAGE, 'autoplay-blocked');
     }
 
-    this.context = context;
-    this.graph = new AudioGraph(context, { masterGain: 0.8 });
-    this.pool = new VoicePool(this.graph, (error) => this.fail(error, 'scheduling-failed'));
-    context.onstatechange = () => this.handleContextStateChange();
+    this.attachContext(context);
     this.error = null;
     return context;
+  }
+
+  /** Own a freshly created context: graph, voice pool, and state-change handling. */
+  private attachContext(context: AudioContext): void {
+    this.context = context;
+    this.graph = new AudioGraph(context, { masterGain: 0.8 });
+    this.pool = new VoicePool(
+      this.graph,
+      (error) => this.fail(error, 'scheduling-failed'),
+      this.resolveSample,
+    );
+    context.onstatechange = () => this.handleContextStateChange();
+  }
+
+  /**
+   * Decode an audio file without requiring a running context (decoding works suspended), so
+   * samples can be loaded before the user enables playback. Creates an idle context if none
+   * exists yet.
+   */
+  async decodeAudioData(data: ArrayBuffer): Promise<AudioBuffer> {
+    if (!this.hasWebAudioSupport()) {
+      this.unsupported = true;
+      this.emit();
+      throw new AudioEngineError(UNSUPPORTED_MESSAGE, 'unsupported');
+    }
+    let context = this.context && this.context.state !== 'closed' ? this.context : null;
+    if (!context) {
+      try {
+        context = this.createContext
+          ? this.createContext()
+          : new window.AudioContext({ latencyHint: 'interactive' });
+      } catch (error) {
+        throw this.fail(error, 'device-unavailable');
+      }
+      this.attachContext(context);
+      this.emit();
+    }
+    return new Promise<AudioBuffer>((resolve, reject) => {
+      try {
+        // Copy the bytes: decodeAudioData detaches the input buffer in some browsers.
+        const result = context!.decodeAudioData(data.slice(0), resolve, (error: unknown) =>
+          reject(error ?? new Error('The browser could not decode this audio file.')),
+        );
+        if (result && typeof (result as Promise<AudioBuffer>).then === 'function') {
+          (result as Promise<AudioBuffer>).then(resolve, reject);
+        }
+      } catch (error) {
+        reject(error);
+      }
+    });
+  }
+
+  /**
+   * Audition a channel's sound once without starting the transport: the loaded sample buffer
+   * when one is assigned, otherwise the built-in voice resolved from `sampleId`.
+   */
+  async auditionSample(channelId: string, sampleId: string): Promise<void> {
+    const context = await this.ensureContext();
+    const time = context.currentTime + 0.02;
+    this.scheduleEvent({
+      event: {
+        kind: 'sample',
+        id: `audition:${channelId}:${time}`,
+        step: 0,
+        channelId,
+        sampleId,
+        velocity: 0.9,
+      },
+      time,
+      durationSeconds: 0,
+      iteration: 0,
+    });
+    this.emit();
   }
 
   private handleContextStateChange(): void {

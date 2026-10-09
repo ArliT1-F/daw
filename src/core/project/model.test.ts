@@ -29,4 +29,32 @@ describe('versioned project model', () => {
     expect(() => assertValidProject(unknownVersion)).toThrow(ProjectValidationError);
     expect(() => deserializeProject(JSON.stringify(unknownVersion))).toThrow('Unsupported project version');
   });
+
+  it('rejects projects with invalid sequencer data (swing, velocities, mute state)', () => {
+    const badSwing = { ...createInitialProject(), settings: { ...createInitialProject().settings, swing: 1.5 } };
+    expect(() => assertValidProject(badSwing)).toThrow('Swing');
+
+    const missingVelocities = createInitialProject();
+    delete missingVelocities.patterns[0].velocities['channel-kick'];
+    expect(() => assertValidProject(missingVelocities)).toThrow('velocities are missing');
+
+    const badVelocity = createInitialProject();
+    badVelocity.patterns[0].velocities['channel-kick'][3] = 7;
+    expect(() => assertValidProject(badVelocity)).toThrow('0 to 1');
+
+    const missingMute = createInitialProject();
+    delete (missingMute.channels[0] as Partial<typeof missingMute.channels[0]>).muted;
+    expect(() => assertValidProject(missingMute)).toThrow('mute state');
+
+    const badSample = createInitialProject();
+    badSample.channels[0].sampleId = '   ';
+    expect(() => assertValidProject(badSample)).toThrow('sample ID');
+  });
+
+  it('keeps step velocity rows aligned with step rows in the starter project', () => {
+    const project = createInitialProject();
+    for (const channel of project.channels) {
+      expect(project.patterns[0].velocities[channel.id]).toHaveLength(project.patterns[0].steps[channel.id].length);
+    }
+  });
 });

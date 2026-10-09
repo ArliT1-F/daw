@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { AudioGraph } from './AudioGraph';
-import { createFakeAudioContext } from './__fixtures__/fakeAudioContext';
-import { VOICE_RELEASE_SECONDS, VoicePool, createVoice, midiToFrequency, resolveDrumVoice } from './voices';
+import { FakeAudioBuffer, createFakeAudioContext } from './__fixtures__/fakeAudioContext';
+import { VOICE_RELEASE_SECONDS, VoicePool, createVoice, midiToFrequency, resolveDrumVoice, type SampleResolver } from './voices';
 import type { ScheduledEventTiming } from '../core/events/musicalEvents';
 
 function createPool() {
@@ -85,6 +85,45 @@ describe('voice creation', () => {
     const { graph } = createPool();
     const unknown = { ...kick, kind: 'midi' } as unknown as ScheduledEventTiming['event'];
     expect(createVoice(timing(unknown, 0), graph, () => {})).toBeNull();
+  });
+});
+
+describe('sample-buffer voices', () => {
+  const buffer = () => new FakeAudioBuffer(1, 4800, 48000); // 0.1 s
+
+  it('plays a decoded sample buffer instead of the synthesized drum voice', () => {
+    const { fake, graph } = createPool();
+    const resolve: SampleResolver = (sampleId) => (sampleId === 'sample-kick' ? (buffer() as unknown as AudioBuffer) : null);
+    const event = { ...kick, sampleId: 'sample-kick' };
+    const voice = createVoice(timing(event, 1), graph, () => {}, resolve);
+
+    expect(voice).not.toBeNull();
+    expect(fake.oscillators).toHaveLength(0);
+    expect(fake.bufferSources).toHaveLength(1);
+    expect(fake.bufferSources[0].buffer).not.toBeNull();
+    expect(fake.bufferSources[0].startedAt).toBe(1);
+    // The buffer is 0.1 s long; the voice ends with it.
+    expect(voice?.endTime).toBeCloseTo(1.1, 6);
+  });
+
+  it('falls back to the built-in drum voice when no buffer is loaded', () => {
+    const { fake, graph } = createPool();
+    const resolve: SampleResolver = () => null;
+    const voice = createVoice(timing(kick, 1), graph, () => {}, resolve);
+
+    expect(voice).not.toBeNull();
+    expect(fake.oscillators).toHaveLength(1);
+    expect(fake.bufferSources).toHaveLength(0);
+  });
+
+  it('passes the resolver through the voice pool', () => {
+    const { fake, graph } = createPool();
+    const resolve: SampleResolver = () => buffer() as unknown as AudioBuffer;
+    const pool = new VoicePool(graph, undefined, resolve);
+    pool.schedule(timing({ ...kick, sampleId: 'anything' }, 2));
+    expect(fake.bufferSources).toHaveLength(1);
+    expect(fake.bufferSources[0].startedAt).toBe(2);
+    expect(fake.oscillators).toHaveLength(0);
   });
 });
 

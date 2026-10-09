@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { AudioEngineError, BrowserAudioEngine } from './AudioEngine';
-import { createFakeAudioContext, type FakeAudioContext } from './__fixtures__/fakeAudioContext';
+import { FakeAudioBuffer, createFakeAudioContext, type FakeAudioContext } from './__fixtures__/fakeAudioContext';
 import { buildPlaylistEvents } from '../core/events';
 import { createInitialProject } from '../core/project/model';
 import type { RepeatingTimer } from './timer';
@@ -51,7 +51,13 @@ const manualTimer: RepeatingTimer = {
 
 const TICK_STEP = 0.02;
 
-function createEngine(options: { startRunning?: boolean; events?: MusicalEvent[] } = {}): Harness {
+function createEngine(
+  options: {
+    startRunning?: boolean;
+    events?: MusicalEvent[];
+    resolveSample?: (sampleId: string) => AudioBuffer | null;
+  } = {},
+): Harness {
   const { context, fake } = createFakeAudioContext({ startRunning: options.startRunning ?? false });
   const engine = new BrowserAudioEngine({
     createContext: () => context,
@@ -60,6 +66,7 @@ function createEngine(options: { startRunning?: boolean; events?: MusicalEvent[]
     loop: { startStep: 0, endStep: LOOP_END_STEP },
     lookaheadSeconds: 0.12,
     timer: manualTimer,
+    resolveSample: options.resolveSample,
   });
   if (options.events) engine.setSequence(options.events);
   return {
@@ -362,6 +369,44 @@ describe('audio engine playback', () => {
     expect(harness.engine.transport.status).toBe('stopped');
     expect(harness.fake.oscillators).toHaveLength(1);
     expect(harness.fake.oscillators[0].startedAt).toBeCloseTo(0.02, 6);
+  });
+
+  it('auditions a loaded sample buffer without starting the transport', async () => {
+    const buffer = new FakeAudioBuffer(1, 4800, 48000);
+    const harness = createEngine({ resolveSample: () => buffer as unknown as AudioBuffer });
+    await harness.engine.auditionSample('channel-kick', 'sample-1');
+
+    expect(harness.engine.transport.status).toBe('stopped');
+    expect(harness.fake.bufferSources).toHaveLength(1);
+    expect(harness.fake.bufferSources[0].buffer).not.toBeNull();
+    expect(harness.fake.bufferSources[0].startedAt).toBeCloseTo(0.02, 6);
+    expect(harness.fake.oscillators).toHaveLength(0);
+  });
+
+  it('auditions the built-in voice when no sample buffer is loaded', async () => {
+    const harness = createEngine({ resolveSample: () => null });
+    await harness.engine.auditionSample('channel-kick', 'Kick');
+    expect(harness.engine.transport.status).toBe('stopped');
+    expect(harness.fake.oscillators).toHaveLength(1);
+    expect(harness.fake.bufferSources).toHaveLength(0);
+  });
+
+  it('decodes sample files without resuming or running the transport', async () => {
+    const harness = createEngine();
+    const decoded = await harness.engine.decodeAudioData(new ArrayBuffer(128));
+
+    expect(decoded.length).toBeGreaterThan(0);
+    expect(harness.fake.decodeCount).toBe(1);
+    expect(harness.fake.resumeCount).toBe(0);
+    expect(harness.engine.transport.status).toBe('stopped');
+    // The idle context is attached so later playback reuses it.
+    expect(harness.engine.status).toBe('suspended');
+  });
+
+  it('propagates decode failures to the caller', async () => {
+    const harness = createEngine();
+    harness.fake.failNextDecode = true;
+    await expect(harness.engine.decodeAudioData(new ArrayBuffer(64))).rejects.toThrow(/not supported/);
   });
 
   it('aligns the visual playhead with the reported output latency', async () => {

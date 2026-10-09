@@ -1,6 +1,12 @@
 export const PROJECT_FORMAT = 'gridline-project' as const;
 export const PROJECT_VERSION = 1 as const;
 export const DEFAULT_PATTERN_STEPS = 16;
+/** Step lengths the step sequencer can toggle between. */
+export const SUPPORTED_PATTERN_LENGTHS = [16, 32] as const;
+/** Velocity applied to steps the model has no explicit velocity for (0..1). */
+export const DEFAULT_STEP_VELOCITY = 0.85;
+/** Swing is stored as a fraction of full triplet feel, 0 (straight) to 1. */
+export const MAX_SWING = 1;
 
 export type ChannelKind = 'drum' | 'instrument';
 export type MixerChannelRole = 'master' | 'insert';
@@ -13,6 +19,8 @@ export interface TimeSignature {
 export interface ProjectSettings {
   tempo: number;
   timeSignature: TimeSignature;
+  /** Shuffle amount applied to offbeat steps during playback: 0 (straight) .. 1 (triplet). */
+  swing: number;
 }
 
 export interface Channel {
@@ -21,6 +29,14 @@ export interface Channel {
   kind: ChannelKind;
   color: string;
   mixerChannelId: string;
+  /** Silent during playback when true. Serializable mix state, not an audio object. */
+  muted: boolean;
+  /** When any channel is soloed, only soloed (and unmuted) channels play. */
+  solo: boolean;
+  /** Stable ID of a loaded sample asset. Absent = built-in synthesized voice. */
+  sampleId?: string;
+  /** Display name of the loaded sample file. */
+  sampleName?: string;
 }
 
 export interface Note {
@@ -36,6 +52,8 @@ export interface Pattern {
   name: string;
   lengthSteps: number;
   steps: Record<string, boolean[]>;
+  /** Per-step velocity (0..1) parallel to `steps`; defaults to DEFAULT_STEP_VELOCITY. */
+  velocities: Record<string, number[]>;
   notes: Record<string, Note[]>;
 }
 
@@ -123,6 +141,10 @@ export function assertValidProject(value: unknown): asserts value is Project {
     'Tempo must be between 20 and 300 BPM.',
   );
   ensure(isValidTimeSignature(value.settings.timeSignature), 'Time signature is invalid.');
+  ensure(
+    Number.isFinite(value.settings.swing) && Number(value.settings.swing) >= 0 && Number(value.settings.swing) <= MAX_SWING,
+    'Swing must be between 0 and 1.',
+  );
 
   ensure(Array.isArray(value.channels), 'Project channels must be an array.');
   ensure(Array.isArray(value.patterns) && value.patterns.length > 0, 'A project must contain at least one pattern.');
@@ -141,6 +163,14 @@ export function assertValidProject(value: unknown): asserts value is Project {
     ensure(channel.kind === 'drum' || channel.kind === 'instrument', 'Channel kind is invalid.');
     ensure(typeof channel.color === 'string' && /^#[\da-f]{6}$/i.test(channel.color), 'Channel color must be a six-digit hex value.');
     ensure(typeof channel.mixerChannelId === 'string', 'Channel mixer routing ID is missing.');
+    ensure(typeof channel.muted === 'boolean', 'Channel mute state must be a boolean.');
+    ensure(typeof channel.solo === 'boolean', 'Channel solo state must be a boolean.');
+    if (channel.sampleId !== undefined) {
+      ensure(typeof channel.sampleId === 'string' && channel.sampleId.trim().length > 0, 'Channel sample ID must be a non-empty string.');
+    }
+    if (channel.sampleName !== undefined) {
+      ensure(typeof channel.sampleName === 'string' && channel.sampleName.trim().length > 0, 'Channel sample name must be a non-empty string.');
+    }
   }
   ensureUniqueIds(channels as Array<{ id: string }>, 'Channel');
   const channelIds = new Set(channels.map((channel) => String((channel as Record<string, unknown>).id)));
@@ -162,13 +192,19 @@ export function assertValidProject(value: unknown): asserts value is Project {
     ensure(typeof pattern.id === 'string' && pattern.id.trim().length > 0, 'Pattern ID is missing.');
     ensure(typeof pattern.name === 'string' && pattern.name.trim().length > 0, 'Pattern name is missing.');
     ensure(Number.isInteger(pattern.lengthSteps) && Number(pattern.lengthSteps) >= 1 && Number(pattern.lengthSteps) <= 1024, 'Pattern length is invalid.');
-    ensure(isRecord(pattern.steps) && isRecord(pattern.notes), 'Pattern step and note maps are required.');
+    ensure(isRecord(pattern.steps) && isRecord(pattern.velocities) && isRecord(pattern.notes), 'Pattern step, velocity, and note maps are required.');
 
     for (const channelId of channelIds) {
       const steps = pattern.steps[channelId];
+      const velocities = pattern.velocities[channelId];
       const notes = pattern.notes[channelId];
       ensure(Array.isArray(steps) && steps.length === Number(pattern.lengthSteps), `Pattern steps are missing for channel ${channelId}.`);
       ensure(steps.every((step) => typeof step === 'boolean'), `Pattern steps for channel ${channelId} must be boolean values.`);
+      ensure(Array.isArray(velocities) && velocities.length === Number(pattern.lengthSteps), `Pattern velocities are missing for channel ${channelId}.`);
+      ensure(
+        velocities.every((velocity) => Number.isFinite(velocity) && Number(velocity) >= 0 && Number(velocity) <= 1),
+        `Pattern velocities for channel ${channelId} must be from 0 to 1.`,
+      );
       ensure(Array.isArray(notes), `Pattern notes are missing for channel ${channelId}.`);
       for (const note of notes) {
         ensure(isRecord(note), 'Note data must be an object.');
@@ -181,6 +217,7 @@ export function assertValidProject(value: unknown): asserts value is Project {
       ensureUniqueIds(notes as Array<{ id: string }>, 'Note');
     }
     ensure(Object.keys(pattern.steps).length === channelIds.size, 'Pattern contains steps for an unknown channel.');
+    ensure(Object.keys(pattern.velocities).length === channelIds.size, 'Pattern contains velocities for an unknown channel.');
     ensure(Object.keys(pattern.notes).length === channelIds.size, 'Pattern contains notes for an unknown channel.');
   }
   ensureUniqueIds(patterns as Array<{ id: string }>, 'Pattern');
@@ -200,12 +237,16 @@ function buildStepRow(length: number, activeSteps: number[] = []): boolean[] {
   return Array.from({ length }, (_, index) => activeSteps.includes(index));
 }
 
+function buildVelocityRow(length: number): number[] {
+  return Array.from({ length }, () => DEFAULT_STEP_VELOCITY);
+}
+
 export function createInitialProject(): Project {
   const channels: Channel[] = [
-    { id: 'channel-kick', name: 'Kick', kind: 'drum', color: '#e6a75c', mixerChannelId: 'mixer-insert-1' },
-    { id: 'channel-snare', name: 'Snare', kind: 'drum', color: '#e67872', mixerChannelId: 'mixer-insert-2' },
-    { id: 'channel-hat', name: 'Closed Hat', kind: 'drum', color: '#79c89b', mixerChannelId: 'mixer-insert-3' },
-    { id: 'channel-bass', name: 'Soft Synth', kind: 'instrument', color: '#9992e8', mixerChannelId: 'mixer-insert-4' },
+    { id: 'channel-kick', name: 'Kick', kind: 'drum', color: '#e6a75c', mixerChannelId: 'mixer-insert-1', muted: false, solo: false },
+    { id: 'channel-snare', name: 'Snare', kind: 'drum', color: '#e67872', mixerChannelId: 'mixer-insert-2', muted: false, solo: false },
+    { id: 'channel-hat', name: 'Closed Hat', kind: 'drum', color: '#79c89b', mixerChannelId: 'mixer-insert-3', muted: false, solo: false },
+    { id: 'channel-bass', name: 'Soft Synth', kind: 'instrument', color: '#9992e8', mixerChannelId: 'mixer-insert-4', muted: false, solo: false },
   ];
   const notes: Record<string, Note[]> = Object.fromEntries(channels.map((channel) => [channel.id, []]));
   notes['channel-bass'] = [
@@ -220,7 +261,7 @@ export function createInitialProject(): Project {
     version: PROJECT_VERSION,
     id: 'project-starter',
     name: 'Untitled Session',
-    settings: { tempo: 124, timeSignature: { numerator: 4, denominator: 4 } },
+    settings: { tempo: 124, timeSignature: { numerator: 4, denominator: 4 }, swing: 0 },
     channels,
     patterns: [
       {
@@ -232,6 +273,12 @@ export function createInitialProject(): Project {
           'channel-snare': buildStepRow(DEFAULT_PATTERN_STEPS, [4, 12]),
           'channel-hat': buildStepRow(DEFAULT_PATTERN_STEPS, [0, 2, 4, 6, 8, 10, 12, 14]),
           'channel-bass': buildStepRow(DEFAULT_PATTERN_STEPS, [0, 8]),
+        },
+        velocities: {
+          'channel-kick': buildVelocityRow(DEFAULT_PATTERN_STEPS),
+          'channel-snare': buildVelocityRow(DEFAULT_PATTERN_STEPS),
+          'channel-hat': buildVelocityRow(DEFAULT_PATTERN_STEPS),
+          'channel-bass': buildVelocityRow(DEFAULT_PATTERN_STEPS),
         },
         notes,
       },

@@ -1,5 +1,6 @@
-import { useCallback, useEffect, useReducer, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react';
 import { BrowserAudioEngine, type AudioEngineState } from './audio/AudioEngine';
+import { SampleStore } from './audio/sampleStore';
 import { ErrorNotice } from './components/ErrorNotice';
 import { createAppError, type AppError, type ErrorSource } from './core/errors';
 import { applyProjectCommand, createProjectHistory, projectHistoryReducer, type ProjectCommand } from './core/commands';
@@ -11,7 +12,7 @@ import {
   transportReducer,
 } from './core/transport';
 import { BrowserPanel } from './features/browser/BrowserPanel';
-import { ChannelRack } from './features/channel-rack/ChannelRack';
+import { ChannelRack, type ChannelSampleStatus } from './features/channel-rack/ChannelRack';
 import { Mixer } from './features/mixer/Mixer';
 import { PianoRoll } from './features/piano-roll/PianoRoll';
 import { Playlist } from './features/playlist/Playlist';
@@ -41,11 +42,20 @@ const PANEL_HOTKEYS: Record<string, string> = {
 
 export function App() {
   const audioEngineRef = useRef<BrowserAudioEngine | null>(null);
+  const sampleStoreRef = useRef<SampleStore | null>(null);
+  if (!sampleStoreRef.current) {
+    // Runtime asset store: decoded buffers live here, never in the project document.
+    sampleStoreRef.current = new SampleStore((data) => {
+      if (!audioEngineRef.current) throw new Error('The audio engine is not ready to decode samples.');
+      return audioEngineRef.current.decodeAudioData(data);
+    });
+  }
   if (!audioEngineRef.current) {
     audioEngineRef.current = new BrowserAudioEngine({
       tempoBpm: 124,
       timeSignature: { numerator: 4, denominator: 4 },
       loop: { startStep: 0, endStep: DEFAULT_LOOP_STEPS },
+      resolveSample: (sampleId) => sampleStoreRef.current?.get(sampleId) ?? null,
     });
   }
   const audioEngine = audioEngineRef.current;
@@ -61,6 +71,8 @@ export function App() {
   const [appError, setAppError] = useState<AppError | null>(null);
   const [audioState, setAudioState] = useState<AudioEngineState>(() => audioEngine.getState());
   const [selectedChannelId, setSelectedChannelId] = useState('channel-bass');
+  const [selectedPatternId, setSelectedPatternId] = useState(() => history.project.patterns[0]?.id ?? '');
+  const [sampleStatus, setSampleStatus] = useState<Record<string, ChannelSampleStatus>>({});
   const [collapsed, setCollapsed] = useState<CollapsedPanels>({
     channelRack: false,
     pianoRoll: false,
@@ -69,7 +81,7 @@ export function App() {
     browser: false,
   });
   const project = history.project;
-  const pattern = project.patterns[0];
+  const pattern = project.patterns.find((item) => item.id === selectedPatternId) ?? project.patterns[0];
   const activeChannelId = project.channels.some((channel) => channel.id === selectedChannelId)
     ? selectedChannelId
     : project.channels[0]?.id ?? '';
@@ -78,18 +90,39 @@ export function App() {
     if (selectedChannelId !== activeChannelId) setSelectedChannelId(activeChannelId);
   }, [activeChannelId, selectedChannelId]);
 
+  // The event list is rebuilt only when the project changes; the scheduler consumes the exact
+  // same list the UI uses to derive activity lights, so indicators match scheduled audio.
+  const cycleSteps = getTransportCycleSteps(project.settings.timeSignature);
+  const sequenceEvents = useMemo(
+    () =>
+      buildPlaylistEvents(project, {
+        timeSignature: project.settings.timeSignature,
+        endStep: cycleSteps,
+      }),
+    [project, cycleSteps],
+  );
+
+  // Channels with a scheduled event at each step of the displayed pattern (floor of the
+  // possibly-swung step), keyed by step index within the pattern.
+  const activityAtStep = useMemo(() => {
+    const map = new Map<number, Set<string>>();
+    for (const event of sequenceEvents) {
+      if (event.patternId !== pattern.id) continue;
+      const index = Math.floor(event.step) % Math.max(1, pattern.lengthSteps);
+      const channels = map.get(index) ?? new Set<string>();
+      channels.add(event.channelId);
+      map.set(index, channels);
+    }
+    return map;
+  }, [sequenceEvents, pattern.id, pattern.lengthSteps]);
+
   // Keep the engine in step with the project: tempo, signature, loop region, and musical events.
   useEffect(() => {
-    const cycleSteps = getTransportCycleSteps(project.settings.timeSignature);
-    const events = buildPlaylistEvents(project, {
-      timeSignature: project.settings.timeSignature,
-      endStep: cycleSteps,
-    });
     audioEngine.setTempo(project.settings.tempo);
     audioEngine.setTimeSignature(project.settings.timeSignature);
     audioEngine.setLoop({ enabled: loopEnabled, startStep: 0, endStep: cycleSteps });
-    audioEngine.setSequence(events);
-  }, [audioEngine, loopEnabled, project]);
+    audioEngine.setSequence(sequenceEvents);
+  }, [audioEngine, loopEnabled, project.settings.tempo, project.settings.timeSignature, cycleSteps, sequenceEvents]);
 
   useEffect(
     () =>
@@ -106,18 +139,10 @@ export function App() {
   );
 
   // The playhead follows the audio clock; rendering never decides when a sound happens.
+  // When audio is unavailable no events are scheduled, so no playback indicator moves —
+  // a moving playhead must never be disconnected from real scheduled events.
   useEffect(() => {
-    if (transport.status !== 'playing') return undefined;
-    const cycleSteps = getTransportCycleSteps(project.settings.timeSignature);
-
-    if (audioState.status !== 'ready') {
-      // No runnable audio context: keep the visual transport preview from phase one.
-      const sixteenthNoteMs = 60_000 / (project.settings.tempo * 4);
-      const timer = window.setInterval(() => {
-        dispatchTransport({ type: 'tick', cycleSteps });
-      }, sixteenthNoteMs);
-      return () => window.clearInterval(timer);
-    }
+    if (transport.status !== 'playing' || audioState.status !== 'ready') return undefined;
 
     let frame = 0;
     let lastStep = -1;
@@ -131,7 +156,7 @@ export function App() {
     };
     frame = window.requestAnimationFrame(draw);
     return () => window.cancelAnimationFrame(frame);
-  }, [audioEngine, audioState.status, project.settings.tempo, project.settings.timeSignature, transport.status]);
+  }, [audioEngine, audioState.status, cycleSteps, transport.status]);
 
   useEffect(() => () => {
     void audioEngine.dispose().catch((error: unknown) => {
@@ -143,14 +168,60 @@ export function App() {
     setAppError(createAppError(source, error));
   }
 
-  function handleCommand(command: ProjectCommand) {
+  /** Apply an edit; returns true only when the project actually changed. */
+  function handleCommand(command: ProjectCommand): boolean {
     try {
       // Preflight outside the reducer so invalid user edits use the same visible error path as audio errors.
-      applyProjectCommand(project, command);
+      const next = applyProjectCommand(project, command);
+      const changed = next !== project;
       dispatchProject({ type: 'command', command });
       setAppError(null);
+      return changed;
     } catch (error) {
       reportError('project', error);
+      return false;
+    }
+  }
+
+  async function handleLoadSample(channelId: string, file: File): Promise<void> {
+    const displayName = file.name || 'sample';
+    setSampleStatus((current) => ({ ...current, [channelId]: { status: 'loading', name: displayName } }));
+    try {
+      const sample = await sampleStoreRef.current!.add(file);
+      const applied = handleCommand({
+        type: 'channel.sample.assign',
+        channelId,
+        sampleId: sample.id,
+        sampleName: sample.name,
+      });
+      if (!applied) throw new Error('The channel is no longer part of the project.');
+      setSampleStatus((current) => ({ ...current, [channelId]: { status: 'ready', name: sample.name } }));
+    } catch (error) {
+      setSampleStatus((current) => ({
+        ...current,
+        [channelId]: { status: 'error', name: displayName, message: createAppError('application', error).message },
+      }));
+    }
+  }
+
+  function handleDismissSampleError(channelId: string) {
+    setSampleStatus((current) => {
+      if (current[channelId]?.status !== 'error') return current;
+      const next = { ...current };
+      delete next[channelId];
+      return next;
+    });
+  }
+
+  async function handlePreviewChannel(channelId: string): Promise<void> {
+    const channel = project.channels.find((item) => item.id === channelId);
+    if (!channel) return;
+    try {
+      // Loaded samples audition their buffer; unloaded channels fall back to the built-in voice.
+      await audioEngine.auditionSample(channelId, channel.sampleId ?? channel.name);
+      setAppError(null);
+    } catch (error) {
+      reportError('audio', error);
     }
   }
 
@@ -318,11 +389,19 @@ export function App() {
           {appError && <ErrorNotice error={appError} onDismiss={() => setAppError(null)} />}
 
           <ChannelRack
+            activityAtStep={activityAtStep}
             collapsed={collapsed.channelRack}
             onCommand={handleCommand}
+            onDismissSampleError={handleDismissSampleError}
+            onLoadSample={handleLoadSample}
+            onPreviewChannel={handlePreviewChannel}
+            onSelectPattern={setSelectedPatternId}
             onToggle={() => togglePanel('channelRack')}
             pattern={pattern}
+            playbackActive={audioState.transportStatus === 'playing'}
             project={project}
+            sampleStatus={sampleStatus}
+            selectedPatternId={pattern.id}
             transport={transport}
           />
           <div className="middle-panels">
