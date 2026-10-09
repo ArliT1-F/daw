@@ -156,7 +156,27 @@ export function createVoice(
     parts.gains,
     onEnded,
   );
-  for (const source of parts.sources) source.start(time);
+  // Web Audio requires start() before stop(). Scheduling the stop while each voice is built
+  // (before start() has been called) throws InvalidStateError in browsers such as Safari.
+  const startedSources: AudioScheduledSourceNode[] = [];
+  try {
+    for (const source of parts.sources) {
+      source.start(time);
+      startedSources.push(source);
+    }
+    for (const source of parts.sources) source.stop(parts.endTime);
+  } catch (error) {
+    // A partial start must not leave a source playing if another node fails to start/schedule.
+    for (const source of startedSources) {
+      try {
+        source.stop(graph.context.currentTime);
+      } catch {
+        /* source already stopped */
+      }
+    }
+    voice.dispose();
+    throw error;
+  }
   return voice;
 }
 
@@ -248,7 +268,6 @@ function createKick(graph: AudioGraph, time: number, velocity: number, destinati
   oscillator.connect(gain);
   gain.connect(destination);
   const endTime = time + 0.34;
-  oscillator.stop(endTime);
   return { sources: [oscillator], gains: [gain], endTime };
 }
 
@@ -269,7 +288,6 @@ function createSnare(graph: AudioGraph, time: number, velocity: number, destinat
   noise.connect(noiseBand);
   noiseBand.connect(noiseGain);
   noiseGain.connect(destination);
-  noise.stop(time + 0.2);
 
   const body = context.createOscillator();
   body.type = 'triangle';
@@ -281,7 +299,6 @@ function createSnare(graph: AudioGraph, time: number, velocity: number, destinat
   bodyGain.gain.exponentialRampToValueAtTime(SILENCE, time + 0.1);
   body.connect(bodyGain);
   bodyGain.connect(destination);
-  body.stop(time + 0.2);
 
   return { sources: [noise, body], gains: [noiseGain, bodyGain], endTime: time + 0.2 };
 }
@@ -309,7 +326,6 @@ function createHat(graph: AudioGraph, time: number, velocity: number, destinatio
   band.connect(gain);
   gain.connect(destination);
   const endTime = time + 0.07;
-  noise.stop(endTime);
   return { sources: [noise], gains: [gain], endTime };
 }
 
@@ -327,7 +343,6 @@ function createPerc(graph: AudioGraph, time: number, velocity: number, destinati
   oscillator.connect(gain);
   gain.connect(destination);
   const endTime = time + 0.15;
-  oscillator.stop(endTime);
   return { sources: [oscillator], gains: [gain], endTime };
 }
 
@@ -384,7 +399,5 @@ function createSynthParts(
   gain.connect(destination);
 
   const endTime = noteEnd + release + 0.02;
-  for (const source of [sawA, sawB, sub]) source.stop(endTime);
-
   return { sources: [sawA, sawB, sub], gains: [gain], endTime };
 }
