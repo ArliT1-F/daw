@@ -83,7 +83,7 @@ export function ChannelRack({ project, pattern, transport, collapsed, onToggle, 
         })}
       </div>
       <div className="panel-footnote">
-        <span className="footnote-dot" /> Pattern edits are active · sound playback is not implemented
+        <span className="footnote-dot" /> Drum lanes trigger samples · instrument lanes play piano-roll notes
       </div>
     </PanelFrame>
   );

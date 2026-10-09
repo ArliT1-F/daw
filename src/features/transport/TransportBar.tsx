@@ -1,5 +1,5 @@
 import { useEffect, useState, type KeyboardEvent as ReactKeyboardEvent } from 'react';
-import type { AudioEngineStatus } from '../../audio/AudioEngine';
+import type { AudioEngineState } from '../../audio/AudioEngine';
 import type { ProjectCommand, ProjectHistoryState } from '../../core/commands';
 import type { Project } from '../../core/project/model';
 import { formatTransportPosition, type TransportState } from '../../core/transport';
@@ -19,11 +19,17 @@ interface TransportBarProps {
   project: Project;
   history: ProjectHistoryState;
   transport: TransportState;
-  audioStatus: AudioEngineStatus;
+  audioState: AudioEngineState;
   audioBusy: boolean;
+  /** Length of the playback region in sixteenth-note steps. */
+  cycleSteps: number;
+  loopEnabled: boolean;
   onCommand: (command: ProjectCommand) => void;
   onPlayPause: () => void;
   onStop: () => void;
+  onSeek: (step: number) => void;
+  onToggleLoop: () => void;
+  onTestTone: () => void;
   onUndo: () => void;
   onRedo: () => void;
   onEnableAudio: () => void;
@@ -33,11 +39,16 @@ export function TransportBar({
   project,
   history,
   transport,
-  audioStatus,
+  audioState,
   audioBusy,
+  cycleSteps,
+  loopEnabled,
   onCommand,
   onPlayPause,
   onStop,
+  onSeek,
+  onToggleLoop,
+  onTestTone,
   onUndo,
   onRedo,
   onEnableAudio,
@@ -66,13 +77,18 @@ export function TransportBar({
 
   const timeSignature = project.settings.timeSignature;
   const selectedTimeSignature = `${timeSignature.numerator}/${timeSignature.denominator}`;
+  const audioStatus = audioState.status;
   const audioLabel = audioStatus === 'ready'
-    ? 'Audio context ready · playback not implemented'
+    ? `Audio context ready · ${audioState.sampleRate ?? 0} Hz · ${Math.round(audioState.outputLatencySeconds * 1000)} ms out`
     : audioStatus === 'unsupported'
       ? 'Web Audio is unavailable in this browser'
-      : audioStatus === 'closed'
-        ? 'Audio context is closed'
-        : 'Audio is off · playback not implemented';
+      : audioStatus === 'suspended'
+        ? 'Audio context is suspended · press Enable audio to resume'
+        : audioStatus === 'closed'
+          ? 'Audio context is closed'
+          : audioStatus === 'error'
+            ? (audioState.message ?? 'The audio engine reported an error')
+            : 'Audio is off · playback will start on first play';
 
   return (
     <header className="topbar">
@@ -86,21 +102,43 @@ export function TransportBar({
 
       <div aria-label="Transport controls" className="transport-controls" role="group">
         <button
-          aria-label={transport.status === 'playing' ? 'Pause transport preview' : 'Play transport preview'}
+          aria-label={transport.status === 'playing' ? 'Pause' : 'Play'}
           className={`transport-play ${transport.status === 'playing' ? 'is-playing' : ''}`}
           onClick={onPlayPause}
-          title={`${transport.status === 'playing' ? 'Pause' : 'Play'} visual transport · no sound yet`}
+          title={`${transport.status === 'playing' ? 'Pause' : 'Play'} · audio is scheduled on the audio clock`}
           type="button"
         >
           <Icon name={transport.status === 'playing' ? 'pause' : 'play'} size={18} />
         </button>
-        <button aria-label="Stop transport and return to start" className="transport-stop icon-button" onClick={onStop} title="Stop" type="button">
+        <button aria-label="Stop transport and return to start" className="transport-stop icon-button" onClick={onStop} title="Stop · Space toggles play, Esc stops" type="button">
           <Icon name="stop" size={15} />
+        </button>
+        <button
+          aria-label={loopEnabled ? 'Looping is on' : 'Looping is off'}
+          aria-pressed={loopEnabled}
+          className={`transport-loop ${loopEnabled ? 'is-active' : ''}`}
+          onClick={onToggleLoop}
+          title={loopEnabled ? 'Loop the visible region' : 'Play the region once, then stop'}
+          type="button"
+        >
+          LOOP
         </button>
         <div aria-label={`Position ${formatTransportPosition(transport, timeSignature)}`} className="position-readout">
           <span className="position-label">BAR : BEAT : STEP</span>
           <span className="position-value">{formatTransportPosition(transport, timeSignature)}</span>
         </div>
+        <label className="seek-control">
+          <span className="sr-only-text">Seek within the region</span>
+          <input
+            aria-label="Seek within the region"
+            max={cycleSteps - 1}
+            min={0}
+            onChange={(event) => onSeek(Number(event.target.value))}
+            step={1}
+            type="range"
+            value={Math.min(transport.positionStep, cycleSteps - 1)}
+          />
+        </label>
         <div className="transport-divider" />
         <label className="value-control tempo-control">
           <span className="value-label">BPM</span>
@@ -154,6 +192,16 @@ export function TransportBar({
           <span aria-hidden="true" className={`status-light status-light--${audioStatus}`} />
         </button>
         <div className="tool-separator" />
+        <button
+          aria-label="Play a test tone"
+          className="icon-button test-tone-button"
+          disabled={audioBusy}
+          onClick={onTestTone}
+          title="Play a test tone through the audio engine"
+          type="button"
+        >
+          TEST
+        </button>
         <button aria-label="Undo" className="icon-button history-button" disabled={history.past.length === 0} onClick={onUndo} title="Undo · Ctrl/Cmd+Z" type="button">
           <Icon name="undo" size={16} />
         </button>
