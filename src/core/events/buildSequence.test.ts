@@ -46,8 +46,8 @@ describe('playlist event building', () => {
   it('places clips at their start bar and honours clip length', () => {
     const project = createInitialProject();
     project.playlist = [
-      { id: 'clip-a', patternId: 'pattern-main', startBar: 2, lengthBars: 1 },
-      { id: 'clip-b', patternId: 'pattern-main', startBar: 5, lengthBars: 2 },
+      { id: 'clip-a', kind: 'pattern', trackId: 'track-main', patternId: 'pattern-main', startTick: 768, durationTicks: 384, sourceOffsetTicks: 0 },
+      { id: 'clip-b', kind: 'pattern', trackId: 'track-main', patternId: 'pattern-main', startTick: 1920, durationTicks: 768, sourceOffsetTicks: 0 },
     ];
     const events = build(project);
     const kickSteps = events
@@ -64,7 +64,7 @@ describe('playlist event building', () => {
     const emptyNotes: Record<string, Note[]> = {};
     for (const channel of project.channels) emptyNotes[channel.id] = [];
     project.patterns[0].notes = emptyNotes;
-    project.playlist = [{ id: 'clip-a', patternId: 'pattern-main', startBar: 0, lengthBars: 1 }];
+    project.playlist = [{ id: 'clip-a', kind: 'pattern', trackId: 'track-main', patternId: 'pattern-main', startTick: 0, durationTicks: 384, sourceOffsetTicks: 0 }];
     const events = build(project);
     const kicks = events
       .filter((event) => event.kind === 'sample' && event.channelId === 'channel-kick')
@@ -76,15 +76,17 @@ describe('playlist event building', () => {
 
   it('ignores clips that reference a missing pattern', () => {
     const project = createInitialProject();
-    project.playlist = [{ id: 'clip-a', patternId: 'does-not-exist', startBar: 0, lengthBars: 2 }];
+    project.playlist = [{ id: 'clip-a', kind: 'pattern', trackId: 'track-main', patternId: 'does-not-exist', startTick: 0, durationTicks: 768, sourceOffsetTicks: 0 }];
     expect(build(project)).toEqual([]);
   });
 
   it('follows the time signature when converting bars to steps', () => {
     const project = createInitialProject();
-    project.playlist = [{ id: 'clip-a', patternId: 'pattern-main', startBar: 1, lengthBars: 1 }];
+    project.playlist = [{ id: 'clip-a', kind: 'pattern', trackId: 'track-main', patternId: 'pattern-main', startTick: 384, durationTicks: 384, sourceOffsetTicks: 0 }];
+    project.playlist[0].startTick = 12 * TICKS_PER_STEP;
+    project.playlist[0].durationTicks = 12 * TICKS_PER_STEP;
     const events = buildPlaylistEvents(project, { timeSignature: SIX_EIGHT });
-    // 6/8 has 12 steps per bar, but the pattern is still 16 steps long, so only one pass fits.
+    // A clip placed on bar 2 in 6/8 starts at step 12; only part of the pattern fits.
     expect(events[0].step).toBe(12);
     expect(events.every((event) => event.step < 24)).toBe(true);
   });
@@ -108,7 +110,7 @@ describe('playlist event building', () => {
 
   it('truncates notes that cross a clip or loop boundary instead of wrapping them', () => {
     const project = createInitialProject();
-    project.playlist = [{ id: 'clip-a', patternId: 'pattern-main', startBar: 0, lengthBars: 1 }];
+    project.playlist = [{ id: 'clip-a', kind: 'pattern', trackId: 'track-main', patternId: 'pattern-main', startTick: 0, durationTicks: 384, sourceOffsetTicks: 0 }];
     project.patterns[0].notes['channel-bass'] = [
       { id: 'n-edge', pitch: 60, startTick: 14 * TICKS_PER_STEP, durationTicks: 4 * TICKS_PER_STEP, velocity: 0.8 },
     ];
@@ -228,7 +230,7 @@ describe('sequencer playback rules', () => {
       source.notes[channel.id] = source.notes[channel.id].map((note) => ({ ...note }));
     }
     source.steps['channel-kick'][20] = true;
-    project.playlist = [{ id: 'clip-a', patternId: 'pattern-main', startBar: 0, lengthBars: 4 }];
+    project.playlist = [{ id: 'clip-a', kind: 'pattern', trackId: 'track-main', patternId: 'pattern-main', startTick: 0, durationTicks: 1536, sourceOffsetTicks: 0 }];
 
     const events = build(project);
     expect(events.every((event) => event.patternId === 'pattern-main')).toBe(true);

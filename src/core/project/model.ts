@@ -1,7 +1,7 @@
 import { TICKS_PER_STEP } from '../time/ticks';
 
 export const PROJECT_FORMAT = 'gridline-project' as const;
-export const PROJECT_VERSION = 1 as const;
+export const PROJECT_VERSION = 2 as const;
 export const DEFAULT_PATTERN_STEPS = 16;
 /** Step lengths the step sequencer can toggle between. */
 export const SUPPORTED_PATTERN_LENGTHS = [16, 32] as const;
@@ -23,6 +23,21 @@ export interface ProjectSettings {
   timeSignature: TimeSignature;
   /** Shuffle amount applied to offbeat steps during playback: 0 (straight) .. 1 (triplet). */
   swing: number;
+  /** Base tempo is `tempo`; changes apply at absolute song ticks (> 0). */
+  tempoChanges: ProjectTempoChange[];
+  /** Saved song loop, independent of the viewport and editor selection. End is exclusive. */
+  loop: PlaylistLoop;
+}
+
+export interface ProjectTempoChange {
+  tick: number;
+  bpm: number;
+}
+
+export interface PlaylistLoop {
+  enabled: boolean;
+  startTick: number;
+  endTick: number;
 }
 
 export interface Channel {
@@ -66,12 +81,48 @@ export interface Pattern {
   notes: Record<string, Note[]>;
 }
 
-export interface PlaylistClip {
+export interface PlaylistTrack {
   id: string;
-  patternId: string;
-  startBar: number;
-  lengthBars: number;
+  name: string;
+  color: string;
+  muted: boolean;
+  solo: boolean;
 }
+
+/** Serializable metadata. Decoded buffers live only in the runtime SampleStore. */
+export interface AudioAsset {
+  id: string;
+  name: string;
+  durationSeconds: number;
+  /** Small peak envelope for the Playlist preview, not encoded/decoded audio. */
+  peaks?: number[];
+}
+
+interface PlaylistClipBase {
+  id: string;
+  trackId: string;
+  /** Optional instance label; otherwise the reusable source's name is displayed. */
+  name?: string;
+  startTick: number;
+  durationTicks: number;
+}
+
+export interface PatternClip extends PlaylistClipBase {
+  kind: 'pattern';
+  patternId: string;
+  /** Start within the source pattern. Repeated to fill the instance, without copying it. */
+  sourceOffsetTicks: number;
+}
+
+export interface AudioClip extends PlaylistClipBase {
+  kind: 'audio';
+  assetId: string;
+  /** Trim-in in real source seconds. Audio plays at native speed (no time stretching). */
+  sourceOffsetSeconds: number;
+  gain: number;
+}
+
+export type PlaylistClip = PatternClip | AudioClip;
 
 export interface MixerChannel {
   id: string;
@@ -88,6 +139,8 @@ export interface Project {
   settings: ProjectSettings;
   channels: Channel[];
   patterns: Pattern[];
+  tracks: PlaylistTrack[];
+  audioAssets: AudioAsset[];
   playlist: PlaylistClip[];
   mixerChannels: MixerChannel[];
 }
@@ -155,6 +208,21 @@ export function assertValidProject(value: unknown): asserts value is Project {
     'Swing must be between 0 and 1.',
   );
 
+  ensure(Array.isArray(value.settings.tempoChanges), 'Tempo changes must be an array.');
+  let lastTempoTick = 0;
+  for (const change of value.settings.tempoChanges) {
+    ensure(isRecord(change), 'Tempo change data must be an object.');
+    ensure(Number.isSafeInteger(change.tick) && Number(change.tick) > lastTempoTick, 'Tempo changes must have unique, increasing positive ticks.');
+    ensure(Number.isFinite(change.bpm) && Number(change.bpm) >= 20 && Number(change.bpm) <= 300, 'Tempo change must be between 20 and 300 BPM.');
+    lastTempoTick = Number(change.tick);
+  }
+  ensure(isRecord(value.settings.loop), 'Playlist loop is missing.');
+  ensure(typeof value.settings.loop.enabled === 'boolean', 'Loop enabled state must be a boolean.');
+  ensure(Number.isSafeInteger(value.settings.loop.startTick) && Number(value.settings.loop.startTick) >= 0, 'Loop start is invalid.');
+  ensure(Number.isSafeInteger(value.settings.loop.endTick) && Number(value.settings.loop.endTick) > Number(value.settings.loop.startTick), 'Loop end must follow loop start.');
+
+  ensure(Array.isArray(value.tracks) && value.tracks.length > 0, 'A project must contain at least one Playlist track.');
+  ensure(Array.isArray(value.audioAssets), 'Audio assets must be an array.');
   ensure(Array.isArray(value.channels), 'Project channels must be an array.');
   ensure(Array.isArray(value.patterns) && value.patterns.length > 0, 'A project must contain at least one pattern.');
   ensure(Array.isArray(value.playlist), 'Project playlist must be an array.');
@@ -237,13 +305,49 @@ export function assertValidProject(value: unknown): asserts value is Project {
   }
   ensureUniqueIds(patterns as Array<{ id: string }>, 'Pattern');
 
-  const patternIds = new Set(patterns.map((pattern) => String((pattern as Record<string, unknown>).id)));
+  for (const track of value.tracks) {
+    ensure(isRecord(track), 'Playlist track data must be an object.');
+    ensure(typeof track.id === 'string' && track.id.trim().length > 0, 'Playlist track ID is missing.');
+    ensure(typeof track.name === 'string' && track.name.trim().length > 0 && track.name.length <= 80, 'Playlist track name is invalid.');
+    ensure(typeof track.color === 'string' && /^#[\da-f]{6}$/i.test(track.color), 'Playlist track color must be a six-digit hex value.');
+    ensure(typeof track.muted === 'boolean' && typeof track.solo === 'boolean', 'Playlist track mute/solo state must be boolean.');
+  }
+  ensureUniqueIds(value.tracks as Array<{ id: string }>, 'Playlist track');
+  const trackIds = new Set(value.tracks.map((track) => String((track as Record<string, unknown>).id)));
+
+  for (const asset of value.audioAssets) {
+    ensure(isRecord(asset), 'Audio asset data must be an object.');
+    ensure(typeof asset.id === 'string' && asset.id.trim().length > 0, 'Audio asset ID is missing.');
+    ensure(typeof asset.name === 'string' && asset.name.trim().length > 0, 'Audio asset name is missing.');
+    ensure(Number.isFinite(asset.durationSeconds) && Number(asset.durationSeconds) > 0, 'Audio asset duration must be positive.');
+    if (asset.peaks !== undefined) {
+      ensure(Array.isArray(asset.peaks) && asset.peaks.length <= 256 && asset.peaks.every((peak) => Number.isFinite(peak) && Number(peak) >= 0 && Number(peak) <= 1), 'Audio asset peaks are invalid.');
+    }
+  }
+  ensureUniqueIds(value.audioAssets as Array<{ id: string }>, 'Audio asset');
+  const assetsById = new Map((value.audioAssets as AudioAsset[]).map((asset) => [asset.id, asset]));
+  const patternsById = new Map((patterns as Pattern[]).map((pattern) => [pattern.id, pattern]));
   for (const clip of playlist) {
     ensure(isRecord(clip), 'Playlist clip data must be an object.');
     ensure(typeof clip.id === 'string' && clip.id.trim().length > 0, 'Playlist clip ID is missing.');
-    ensure(typeof clip.patternId === 'string' && patternIds.has(clip.patternId), 'Playlist clip references a missing pattern.');
-    ensure(Number.isInteger(clip.startBar) && Number(clip.startBar) >= 0, 'Playlist clip start bar is invalid.');
-    ensure(Number.isInteger(clip.lengthBars) && Number(clip.lengthBars) >= 1, 'Playlist clip length is invalid.');
+    ensure(typeof clip.trackId === 'string' && trackIds.has(clip.trackId), 'Playlist clip references a missing track.');
+    ensure(Number.isSafeInteger(clip.startTick) && Number(clip.startTick) >= 0, 'Playlist clip start is invalid.');
+    ensure(Number.isSafeInteger(clip.durationTicks) && Number(clip.durationTicks) >= 1 && Number.isSafeInteger(Number(clip.startTick) + Number(clip.durationTicks)), 'Playlist clip duration is invalid.');
+    if (clip.name !== undefined) ensure(typeof clip.name === 'string' && clip.name.trim().length > 0 && clip.name.length <= 80, 'Playlist clip name is invalid.');
+    if (clip.kind === 'pattern') {
+      ensure(typeof clip.patternId === 'string' && patternsById.has(clip.patternId), 'Playlist clip references a missing pattern.');
+      // Offsets may exceed a pattern's length after a source edit; playback wraps them modulo its length.
+      ensure(Number.isSafeInteger(clip.sourceOffsetTicks) && Number(clip.sourceOffsetTicks) >= 0, 'Pattern clip source offset is invalid.');
+      ensure(clip.assetId === undefined, 'Pattern clips cannot reference an audio asset.');
+    } else if (clip.kind === 'audio') {
+      ensure(typeof clip.assetId === 'string' && assetsById.has(clip.assetId), 'Playlist clip references a missing audio asset.');
+      const asset = assetsById.get(String(clip.assetId))!;
+      ensure(Number.isFinite(clip.sourceOffsetSeconds) && Number(clip.sourceOffsetSeconds) >= 0 && Number(clip.sourceOffsetSeconds) < asset.durationSeconds, 'Audio clip source offset is outside the asset.');
+      ensure(Number.isFinite(clip.gain) && Number(clip.gain) >= 0 && Number(clip.gain) <= 2, 'Audio clip gain must be between 0 and 2.');
+      ensure(clip.patternId === undefined, 'Audio clips cannot reference a pattern.');
+    } else {
+      ensure(false, 'Playlist clip kind is invalid.');
+    }
   }
   ensureUniqueIds(playlist as Array<{ id: string }>, 'Playlist clip');
 }
@@ -276,7 +380,7 @@ export function createInitialProject(): Project {
     version: PROJECT_VERSION,
     id: 'project-starter',
     name: 'Untitled Session',
-    settings: { tempo: 124, timeSignature: { numerator: 4, denominator: 4 }, swing: 0 },
+    settings: { tempo: 124, timeSignature: { numerator: 4, denominator: 4 }, swing: 0, tempoChanges: [], loop: { enabled: true, startTick: 0, endTick: 128 * TICKS_PER_STEP } },
     channels,
     patterns: [
       {
@@ -298,7 +402,13 @@ export function createInitialProject(): Project {
         notes,
       },
     ],
-    playlist: [{ id: 'clip-main-0', patternId: 'pattern-main', startBar: 0, lengthBars: 4 }],
+    tracks: [
+      { id: 'track-main', name: 'Patterns', color: '#9992e8', muted: false, solo: false },
+      { id: 'track-audio', name: 'Audio', color: '#79c8b8', muted: false, solo: false },
+      { id: 'track-layer', name: 'Layers', color: '#e6a75c', muted: false, solo: false },
+    ],
+    audioAssets: [],
+    playlist: [{ id: 'clip-main-0', kind: 'pattern', trackId: 'track-main', patternId: 'pattern-main', startTick: 0, durationTicks: 64 * TICKS_PER_STEP, sourceOffsetTicks: 0 }],
     mixerChannels: [
       { id: 'mixer-master', name: 'Master', role: 'master' },
       { id: 'mixer-insert-1', name: 'Insert 1', role: 'insert' },

@@ -23,6 +23,7 @@ interface TransportBarProps {
   audioBusy: boolean;
   /** Length of the playback region in sixteenth-note steps. */
   cycleSteps: number;
+  regionStartStep?: number;
   loopEnabled: boolean;
   onCommand: (command: ProjectCommand) => void;
   onPlayPause: () => void;
@@ -42,6 +43,7 @@ export function TransportBar({
   audioState,
   audioBusy,
   cycleSteps,
+  regionStartStep = 0,
   loopEnabled,
   onCommand,
   onPlayPause,
@@ -118,7 +120,7 @@ export function TransportBar({
           aria-pressed={loopEnabled}
           className={`transport-loop ${loopEnabled ? 'is-active' : ''}`}
           onClick={onToggleLoop}
-          title={loopEnabled ? 'Loop the visible region' : 'Play the region once, then stop'}
+          title={loopEnabled ? 'Loop the selected song region' : 'Play the whole arrangement once, then stop'}
           type="button"
         >
           LOOP
@@ -131,12 +133,12 @@ export function TransportBar({
           <span className="sr-only-text">Seek within the region</span>
           <input
             aria-label="Seek within the region"
-            max={cycleSteps - 1}
-            min={0}
+            max={cycleSteps - 1 / 24}
+            min={regionStartStep}
             onChange={(event) => onSeek(Number(event.target.value))}
-            step={1}
+            step={1 / 24}
             type="range"
-            value={Math.min(transport.positionStep, cycleSteps - 1)}
+            value={Math.max(regionStartStep, Math.min(transport.positionStep, cycleSteps - 1 / 24))}
           />
         </label>
         <div className="transport-divider" />

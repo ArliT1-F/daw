@@ -118,3 +118,14 @@ describe('loading samples', () => {
     expect(loadSampleFile).toBeTypeOf('function');
   });
 });
+
+
+describe('Playlist waveform metadata', () => {
+  it('builds bounded peaks from all decoded channels without storing PCM samples', async () => {
+    const { buildWaveformPeaks } = await import('./sampleStore');
+    const buffer = { numberOfChannels: 2, getChannelData: (channel: number) => channel === 0 ? new Float32Array([0, 0.25, -0.5, 0]) : new Float32Array([0.75, 0, 0, -1]) } as AudioBuffer;
+    expect(buildWaveformPeaks(buffer, 2)).toEqual([0.75, 1]);
+    expect(buildWaveformPeaks(buffer, 1000)).toHaveLength(256);
+    expect(buildWaveformPeaks(buffer, NaN)).toHaveLength(96);
+  });
+});

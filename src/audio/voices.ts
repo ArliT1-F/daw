@@ -101,7 +101,16 @@ class WebAudioVoice implements Voice {
   }
 
   cancel(): void {
-    this.stop(this.startTime);
+    if (this.disposed || this.finished) return;
+    if (this.context.currentTime >= this.startTime) {
+      this.stop(this.context.currentTime);
+      return;
+    }
+    // A cancelled future source must never sound, even for the release fade.
+    for (const source of this.sources) {
+      try { source.stop(this.context.currentTime); } catch { /* already stopped */ }
+    }
+    this.endTime = this.context.currentTime;
   }
 
   dispose(): void {
@@ -140,8 +149,9 @@ export function createVoice(
   resolveSample?: SampleResolver,
 ): Voice | null {
   const { event, time } = timing;
+  if (event.velocity <= 0) return null;
   const destination = graph.getChannelBus(event.channelId);
-  const buffer = event.kind === 'sample' ? resolveSample?.(event.sampleId) : null;
+  const buffer = event.kind === 'sample' ? resolveSample?.(event.sampleId) : event.kind === 'audio' ? resolveSample?.(event.assetId) : null;
   const parts =
     event.kind === 'sample'
       ? buffer
@@ -149,10 +159,21 @@ export function createVoice(
         : createDrumParts(graph, event.sampleId, time, event.velocity, destination)
       : event.kind === 'note'
         ? createSynthParts(graph, event.pitch, time, timing.durationSeconds, event.velocity, destination)
-        : null;
+        : event.kind === 'audio' && buffer
+          ? createAudioClipParts(graph, buffer, time, timing.durationSeconds, timing.sourceOffsetSeconds ?? event.sourceOffsetSeconds, event.velocity, destination)
+          : null;
 
   if (!parts) return null;
 
+  if (timing.stopTime !== undefined && timing.stopTime < parts.endTime) {
+    parts.endTime = Math.max(time, timing.stopTime);
+    const fadeAt = Math.max(time, parts.endTime - VOICE_RELEASE_SECONDS);
+    for (const gain of parts.gains) {
+      gain.gain.cancelScheduledValues(fadeAt);
+      gain.gain.setValueAtTime(Math.max(SILENCE, gain.gain.value), fadeAt);
+      gain.gain.exponentialRampToValueAtTime(SILENCE, parts.endTime);
+    }
+  }
   const voice = new WebAudioVoice(
     `${event.id}:${timing.iteration}`,
     event.channelId,
@@ -168,7 +189,11 @@ export function createVoice(
   const startedSources: AudioScheduledSourceNode[] = [];
   try {
     for (const source of parts.sources) {
-      source.start(time);
+      if (event.kind === 'audio') {
+        (source as AudioBufferSourceNode).start(time, timing.sourceOffsetSeconds ?? event.sourceOffsetSeconds, Math.max(0, parts.endTime - time));
+      } else {
+        source.start(time);
+      }
       startedSources.push(source);
     }
     for (const source of parts.sources) source.stop(parts.endTime);
@@ -235,11 +260,13 @@ export class VoicePool {
   /** Cut everything sounding at `atTime`. */
   releaseAll(atTime: number): void {
     for (const voice of [...this.voices]) {
-      if (voice.endTime > atTime) voice.stop(atTime);
+      if (voice.startTime >= atTime) voice.cancel();
+      else if (voice.endTime > atTime) voice.stop(atTime);
     }
   }
 
   clear(): void {
+    this.releaseAll(this.graph.context.currentTime);
     for (const voice of [...this.voices]) voice.dispose();
     this.voices.clear();
   }
@@ -286,6 +313,28 @@ function createSampleParts(
   gain.gain.setValueAtTime(peak, endTime - release);
   gain.gain.exponentialRampToValueAtTime(SILENCE, endTime);
 
+  source.connect(gain);
+  gain.connect(destination);
+  return { sources: [source], gains: [gain], endTime };
+}
+
+/** Trimmed native-speed asset playback. Unlike a drum trigger, a missing asset is silent. */
+function createAudioClipParts(
+  graph: AudioGraph, buffer: AudioBuffer, time: number, durationSeconds: number,
+  offsetSeconds: number, velocity: number, destination: AudioNode,
+): VoiceParts | null {
+  const duration = Math.min(durationSeconds, buffer.duration - offsetSeconds);
+  if (duration <= 0 || offsetSeconds < 0) return null;
+  const source = graph.context.createBufferSource();
+  const gain = graph.context.createGain();
+  const endTime = time + duration;
+  const peak = Math.max(SILENCE, Math.min(2, velocity));
+  const fade = Math.min(0.004, duration / 3);
+  source.buffer = buffer;
+  gain.gain.setValueAtTime(SILENCE, time);
+  gain.gain.linearRampToValueAtTime(peak, time + fade);
+  gain.gain.setValueAtTime(peak, endTime - fade);
+  gain.gain.linearRampToValueAtTime(SILENCE, endTime);
   source.connect(gain);
   gain.connect(destination);
   return { sources: [source], gains: [gain], endTime };
@@ -397,9 +446,9 @@ function createSynthParts(
   const context = graph.context;
   const frequency = midiToFrequency(pitch);
   const peak = Math.max(SILENCE * 2, velocity * 0.35);
-  const hold = Math.max(0.05, durationSeconds);
+  const hold = Math.max(0.0001, durationSeconds);
   const noteEnd = time + hold;
-  const attack = Math.min(0.01, Math.max(0.002, hold * 0.2));
+  const attack = Math.min(0.01, Math.max(0.0001, hold * 0.2));
   const release = 0.06;
   const sustainLevel = Math.max(SILENCE * 2, peak * 0.7);
 

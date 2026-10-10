@@ -5,14 +5,18 @@ import {
   type Channel,
   type Note,
   type Pattern,
-  type PlaylistClip,
   type Project,
   type TimeSignature,
   isValidTimeSignature,
 } from '../project/model';
 import { patternLengthTicks } from '../time/ticks';
+import { applyArrangementCommand, type ArrangementCommand } from './arrangementCommands';
+import { ProjectCommandError } from './commandError';
+export { ProjectCommandError } from './commandError';
 
 export type ProjectCommand =
+  | ArrangementCommand
+  | { type: 'project.batch'; commands: ProjectCommand[] }
   | { type: 'project.tempo.set'; tempo: number }
   | { type: 'project.swing.set'; swing: number }
   | { type: 'project.time-signature.set'; timeSignature: TimeSignature }
@@ -34,15 +38,8 @@ export type ProjectCommand =
   | { type: 'pattern.note.remove'; patternId: string; channelId: string; noteId: string }
   | { type: 'pattern.note.update'; patternId: string; channelId: string; noteId: string; changes: Partial<Omit<Note, 'id'>> }
   | { type: 'pattern.notes.replace'; patternId: string; channelId: string; notes: Note[] }
-  | { type: 'playlist.clip.add'; clip: PlaylistClip }
-  | { type: 'playlist.clip.remove'; clipId: string };
+;
 
-export class ProjectCommandError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = 'ProjectCommandError';
-  }
-}
 
 function requirePattern(project: Project, patternId: string): Pattern {
   const pattern = project.patterns.find((item) => item.id === patternId);
@@ -166,6 +163,8 @@ function replaceNoteLane(project: Project, patternId: string, channelId: string,
 /** Apply one project edit immutably. The same command can be replayed after undo. */
 export function applyProjectCommand(project: Project, command: ProjectCommand): Project {
   switch (command.type) {
+    case 'project.batch':
+      return command.commands.reduce(applyProjectCommand, project);
     case 'project.tempo.set': {
       if (!Number.isFinite(command.tempo) || command.tempo < 20 || command.tempo > 300) {
         throw new ProjectCommandError('Tempo must be between 20 and 300 BPM.');
@@ -473,22 +472,19 @@ export function applyProjectCommand(project: Project, command: ProjectCommand): 
       return replaceNoteLane(project, command.patternId, command.channelId, command.notes);
     }
 
-    case 'playlist.clip.add': {
-      const { clip } = command;
-      if (!clip.id.trim() || project.playlist.some((item) => item.id === clip.id)) {
-        throw new ProjectCommandError('Playlist clip ID is missing or already in use.');
-      }
-      requirePattern(project, clip.patternId);
-      if (!Number.isInteger(clip.startBar) || clip.startBar < 0 || !Number.isInteger(clip.lengthBars) || clip.lengthBars < 1) {
-        throw new ProjectCommandError('Playlist clip position or length is invalid.');
-      }
-      return { ...project, playlist: [...project.playlist, { ...clip }] };
-    }
-
-    case 'playlist.clip.remove': {
-      const playlist = project.playlist.filter((clip) => clip.id !== command.clipId);
-      return playlist.length === project.playlist.length ? project : { ...project, playlist };
-    }
+    case 'playlist.track.add':
+    case 'playlist.track.rename':
+    case 'playlist.track.reorder':
+    case 'playlist.track.mute.set':
+    case 'playlist.track.solo.set':
+    case 'playlist.track.remove':
+    case 'playlist.clip.add':
+    case 'playlist.clip.remove':
+    case 'playlist.clips.edit':
+    case 'playlist.loop.set':
+    case 'audio.asset.add':
+    case 'project.tempo-changes.set':
+      return applyArrangementCommand(project, command);
 
     default: {
       const exhaustiveCheck: never = command;

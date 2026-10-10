@@ -6,16 +6,20 @@
  * the browser engine, rendered offline, or asserted in tests.
  */
 
-export type MusicalEventKind = 'sample' | 'note';
+export type MusicalEventKind = 'sample' | 'note' | 'audio';
 
 /** One-shot percussion/sample trigger. */
 export interface SampleTriggerEvent {
   readonly kind: 'sample';
   readonly id: string;
-  /** Position within the loop, in sixteenth-note steps (fractional when swung). */
+  /** Absolute song position in sixteenth-note steps (fractional when swung). */
   readonly step: number;
   /** Pattern this event came from, when it was built from project data. */
   readonly patternId?: string;
+  readonly clipId?: string;
+  readonly trackId?: string;
+  /** Exclusive instance boundary; even one-shot tails may not escape it. */
+  readonly endStep?: number;
   readonly channelId: string;
   /** Sample asset id. Falls back to a synthesized placeholder voice when unloaded. */
   readonly sampleId: string;
@@ -30,6 +34,10 @@ export interface NoteEvent {
   /** Fractional when swung. */
   readonly step: number;
   readonly patternId?: string;
+  readonly clipId?: string;
+  readonly trackId?: string;
+  /** Exclusive instance boundary; even one-shot tails may not escape it. */
+  readonly endStep?: number;
   readonly channelId: string;
   /** MIDI note number, 0..127. */
   readonly pitch: number;
@@ -37,7 +45,41 @@ export interface NoteEvent {
   readonly durationSteps: number;
 }
 
-export type MusicalEvent = SampleTriggerEvent | NoteEvent;
+/** Native-speed playback of a trimmed reusable audio asset. */
+export interface AudioClipEvent {
+  readonly kind: 'audio';
+  readonly id: string;
+  readonly step: number;
+  readonly channelId: string;
+  readonly clipId?: string;
+  readonly trackId?: string;
+  readonly patternId?: undefined;
+  readonly endStep?: number;
+  readonly assetId: string;
+  readonly sourceOffsetSeconds: number;
+  readonly sourceDurationSeconds: number;
+  readonly durationSteps: number;
+  readonly velocity: number;
+}
+
+export type MusicalEvent = SampleTriggerEvent | NoteEvent | AudioClipEvent;
+
+/** A retimed/reassigned one-shot is eligible again; only an unchanged played onset is skipped. */
+export function sampleOnsetKey(event: SampleTriggerEvent): string {
+  return JSON.stringify([event.id, event.patternId, event.step, event.sampleId]);
+}
+
+export interface MusicalEventWindow {
+  /** Half-open onset range, in absolute song steps. */
+  startStep: number;
+  endStep: number;
+  /** Also return held notes/audio intersecting startStep (start/resume/seek/loop chase). */
+  includeSustains?: boolean;
+}
+
+export interface MusicalEventSource {
+  queryWindow(window: MusicalEventWindow): readonly MusicalEvent[];
+}
 
 /** An event resolved onto the audio clock. */
 export interface ScheduledEventTiming {
@@ -48,6 +90,10 @@ export interface ScheduledEventTiming {
   readonly durationSeconds: number;
   /** Loop iteration this event belongs to. */
   readonly iteration: number;
+  /** Resolved trim-in + elapsed source time, when chasing into an audio clip. */
+  readonly sourceOffsetSeconds?: number;
+  /** Absolute hard boundary for note releases and sample/audio tails. */
+  readonly stopTime?: number;
 }
 
 /**
@@ -62,7 +108,7 @@ export interface MusicalEventSink {
   releaseAll(atTime: number): void;
 }
 
-const KIND_ORDER: Record<MusicalEventKind, number> = { sample: 0, note: 1 };
+const KIND_ORDER: Record<MusicalEventKind, number> = { sample: 0, note: 1, audio: 2 };
 
 /** Stable ordering by step, then kind, then id, so scheduling is deterministic. */
 export function sortMusicalEvents(events: readonly MusicalEvent[]): MusicalEvent[] {
