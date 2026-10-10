@@ -127,3 +127,22 @@ export class SampleStore {
     this.samples.clear();
   }
 }
+
+/** Bounded, reusable envelope metadata for a clip thumbnail. No audio samples are serialized. */
+export function buildWaveformPeaks(buffer: AudioBuffer, count = 96): number[] {
+  const size = Number.isFinite(count) ? Math.max(1, Math.min(256, Math.floor(count))) : 96;
+  const peaks = Array<number>(size).fill(0);
+  for (let channel = 0; channel < buffer.numberOfChannels; channel += 1) {
+    const data = buffer.getChannelData(channel);
+    for (let index = 0; index < size; index += 1) {
+      const start = Math.floor(index * data.length / size);
+      const end = Math.max(start + 1, Math.floor((index + 1) * data.length / size));
+      // Cap reads for very large files; this is a thumbnail, never an audio rendering path.
+      const stride = Math.max(1, Math.floor((end - start) / 512));
+      for (let position = start; position < Math.min(end, data.length); position += stride) {
+        if (Number.isFinite(data[position])) peaks[index] = Math.max(peaks[index], Math.min(1, Math.abs(data[position])));
+      }
+    }
+  }
+  return peaks;
+}

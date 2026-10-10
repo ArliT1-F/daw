@@ -4,11 +4,13 @@ import { SampleStore } from './audio/sampleStore';
 import { ErrorNotice } from './components/ErrorNotice';
 import { createAppError, type AppError, type ErrorSource } from './core/errors';
 import { applyProjectCommand, createProjectHistory, projectHistoryReducer, type ProjectCommand } from './core/commands';
-import { createInitialProject } from './core/project/model';
-import { buildPlaylistEvents } from './core/events';
+import { createInitialProject, createStableId } from './core/project/model';
+import { ArrangementEventSource, buildPatternEvents } from './core/events';
+import { audioDurationTicks, getPlaybackRegion, getProjectTempoMap, getSongEndTick, patternStepAtSongPosition, songStepForPatternTick } from './core/arrangement/arrangement';
+import { TICKS_PER_STEP, ticksToSteps } from './core/time/ticks';
+import { buildWaveformPeaks } from './audio/sampleStore';
 import {
   createTransportState,
-  getTransportCycleSteps,
   transportReducer,
 } from './core/transport';
 import { BrowserPanel } from './features/browser/BrowserPanel';
@@ -29,7 +31,7 @@ const PANEL_IDS = [
 type PanelKey = 'channelRack' | 'pianoRoll' | 'playlist' | 'mixer' | 'browser';
 type CollapsedPanels = Record<PanelKey, boolean>;
 
-/** The visible arrangement region doubles as the playback loop: eight bars of 4/4. */
+/** Initial engine range; the serializable project loop is applied before the first gesture. */
 const DEFAULT_LOOP_STEPS = 128;
 
 const PANEL_HOTKEYS: Record<string, string> = {
@@ -67,11 +69,11 @@ export function App() {
   );
   const [transport, dispatchTransport] = useReducer(transportReducer, undefined, createTransportState);
   const [audioBusy, setAudioBusy] = useState(false);
-  const [loopEnabled, setLoopEnabled] = useState(true);
   const [appError, setAppError] = useState<AppError | null>(null);
   const [audioState, setAudioState] = useState<AudioEngineState>(() => audioEngine.getState());
   const [selectedChannelId, setSelectedChannelId] = useState('channel-bass');
   const [selectedPatternId, setSelectedPatternId] = useState(() => history.project.patterns[0]?.id ?? '');
+  const [selectedClipId, setSelectedClipId] = useState<string | undefined>();
   const [sampleStatus, setSampleStatus] = useState<Record<string, ChannelSampleStatus>>({});
   const [collapsed, setCollapsed] = useState<CollapsedPanels>({
     channelRack: false,
@@ -81,6 +83,9 @@ export function App() {
     browser: false,
   });
   const project = history.project;
+  const projectRef = useRef(project);
+  projectRef.current = project;
+  const loopEnabled = project.settings.loop.enabled;
   const pattern = project.patterns.find((item) => item.id === selectedPatternId) ?? project.patterns[0];
   const activeChannelId = project.channels.some((channel) => channel.id === selectedChannelId)
     ? selectedChannelId
@@ -90,57 +95,41 @@ export function App() {
     if (selectedChannelId !== activeChannelId) setSelectedChannelId(activeChannelId);
   }, [activeChannelId, selectedChannelId]);
 
-  // The event list is rebuilt only when the project changes; the scheduler consumes the exact
-  // same list the UI uses to derive activity lights, so indicators match scheduled audio.
-  const cycleSteps = getTransportCycleSteps(project.settings.timeSignature);
-  const sequenceEvents = useMemo(
-    () =>
-      buildPlaylistEvents(project, {
-        timeSignature: project.settings.timeSignature,
-        endStep: cycleSteps,
-      }),
-    [project, cycleSteps],
-  );
-
-  // Channels with a scheduled event at each step of the displayed pattern (floor of the
-  // possibly-swung step), keyed by step index within the pattern.
+  const cycleSteps = ticksToSteps(getSongEndTick(project));
+  const eventSource = useMemo(() => new ArrangementEventSource(project), [project]);
+  const patternPosition = patternStepAtSongPosition(project, pattern.id, transport.positionStep, selectedClipId);
+  const patternTransport = { ...transport, positionStep: patternPosition ?? 0 };
+  const patternPlaybackActive = audioState.transportStatus === 'playing' && patternPosition !== null;
   const activityAtStep = useMemo(() => {
     const map = new Map<number, Set<string>>();
-    for (const event of sequenceEvents) {
-      if (event.patternId !== pattern.id) continue;
-      const index = Math.floor(event.step) % Math.max(1, pattern.lengthSteps);
+    for (const event of buildPatternEvents(project, pattern)) {
+      const index = Math.floor(event.step);
       const channels = map.get(index) ?? new Set<string>();
       channels.add(event.channelId);
       map.set(index, channels);
     }
     return map;
-  }, [sequenceEvents, pattern.id, pattern.lengthSteps]);
+  }, [project, pattern]);
 
-  // Keep the engine in step with the project: tempo, signature, loop region, and musical events.
+  // One atomic reconfiguration and one window refill, never an entire-song event expansion.
   useEffect(() => {
-    audioEngine.setTempo(project.settings.tempo);
-    audioEngine.setTimeSignature(project.settings.timeSignature);
-    audioEngine.setLoop({ enabled: loopEnabled, startStep: 0, endStep: cycleSteps });
-    audioEngine.setSequence(sequenceEvents);
-  }, [audioEngine, loopEnabled, project.settings.tempo, project.settings.timeSignature, cycleSteps, sequenceEvents]);
+    audioEngine.setArrangement(eventSource, {
+      tempoMap: getProjectTempoMap(project),
+      timeSignature: project.settings.timeSignature,
+      loop: getPlaybackRegion(project),
+    });
+  }, [audioEngine, eventSource, project]);
 
-  useEffect(
-    () =>
-      audioEngine.subscribe((state) => {
-        setAudioState(state);
-        // The engine can stop itself (for example at the end of a non-looping region).
-        if (state.transportStatus === 'stopped') dispatchTransport({ type: 'stop' });
-        const message = state.message;
-        if (message) {
-          setAppError((current) => (current?.message === message ? current : { source: 'audio', message }));
-        }
-      }),
-    [audioEngine],
-  );
+  useEffect(() => audioEngine.subscribe((state) => {
+    setAudioState(state);
+    dispatchTransport({ type: 'sync', status: state.transportStatus === 'playing' ? 'playing' : 'stopped', positionStep: state.positionSteps });
+    if (state.message) {
+      setAppError((current) => current?.message === state.message ? current : { source: 'audio', message: state.message! });
+    }
+  }), [audioEngine]);
 
-  // The playhead follows the audio clock; rendering never decides when a sound happens.
-  // When audio is unavailable no events are scheduled, so no playback indicator moves —
-  // a moving playhead must never be disconnected from real scheduled events.
+  // Rendering only reads the audio clock. Absolute song positions do not wrap at eight bars.
+
   useEffect(() => {
     if (transport.status !== 'playing' || audioState.status !== 'ready') return undefined;
 
@@ -150,7 +139,7 @@ export function App() {
       const step = Math.floor(audioEngine.getPlayheadSteps());
       if (step !== lastStep) {
         lastStep = step;
-        dispatchTransport({ type: 'position', positionStep: step, cycleSteps });
+        dispatchTransport({ type: 'position', positionStep: step });
       }
       frame = window.requestAnimationFrame(draw);
     };
@@ -172,8 +161,10 @@ export function App() {
   function handleCommand(command: ProjectCommand): boolean {
     try {
       // Preflight outside the reducer so invalid user edits use the same visible error path as audio errors.
-      const next = applyProjectCommand(project, command);
-      const changed = next !== project;
+      const current = projectRef.current;
+      const next = applyProjectCommand(current, command);
+      const changed = next !== current;
+      projectRef.current = next;
       dispatchProject({ type: 'command', command });
       setAppError(null);
       return changed;
@@ -189,10 +180,10 @@ export function App() {
     try {
       const sample = await sampleStoreRef.current!.add(file);
       const applied = handleCommand({
-        type: 'channel.sample.assign',
-        channelId,
-        sampleId: sample.id,
-        sampleName: sample.name,
+        type: 'project.batch', commands: [
+          { type: 'audio.asset.add', asset: { id: sample.id, name: sample.name, durationSeconds: sample.durationSeconds, peaks: buildWaveformPeaks(sample.buffer) } },
+          { type: 'channel.sample.assign', channelId, sampleId: sample.id, sampleName: sample.name },
+        ],
       });
       if (!applied) throw new Error('The channel is no longer part of the project.');
       setSampleStatus((current) => ({ ...current, [channelId]: { status: 'ready', name: sample.name } }));
@@ -201,6 +192,22 @@ export function App() {
         ...current,
         [channelId]: { status: 'error', name: displayName, message: createAppError('application', error).message },
       }));
+    }
+  }
+
+  async function handleLoadPlaylistAudio(file: File, trackId: string, startTick: number): Promise<string | null> {
+    try {
+      const sample = await sampleStoreRef.current!.add(file);
+      const clipId = createStableId('clip');
+      const current = projectRef.current;
+      const applied = handleCommand({ type: 'project.batch', commands: [
+        { type: 'audio.asset.add', asset: { id: sample.id, name: sample.name, durationSeconds: sample.durationSeconds, peaks: buildWaveformPeaks(sample.buffer) } },
+        { type: 'playlist.clip.add', clip: { id: clipId, kind: 'audio', trackId, assetId: sample.id, startTick, durationTicks: audioDurationTicks(current, startTick, sample.durationSeconds), sourceOffsetSeconds: 0, gain: 1 } },
+      ] });
+      return applied ? clipId : null;
+    } catch (error) {
+      reportError('application', error);
+      return null;
     }
   }
 
@@ -248,29 +255,26 @@ export function App() {
     } catch (error) {
       reportError('audio', error);
     }
-    // The visual transport keeps working even when audio is unavailable.
-    dispatchTransport({ type: 'play' });
+    if (audioEngine.isPlaying) dispatchTransport({ type: 'play' });
   }
 
   function handleStop() {
     audioEngine.stop();
-    dispatchTransport({ type: 'stop' });
+    dispatchTransport({ type: 'stop', positionStep: audioEngine.getPositionSteps() });
   }
 
   const handleSeek = useCallback(
     (step: number) => {
-      audioEngine.seek(step);
-      dispatchTransport({
-        type: 'position',
-        positionStep: step,
-        cycleSteps: getTransportCycleSteps(project.settings.timeSignature),
-      });
+      const region = getPlaybackRegion(projectRef.current);
+      const target = region.enabled && step >= region.endStep ? region.startStep : Math.max(region.startStep, Math.min(region.endStep - 1 / TICKS_PER_STEP, step));
+      audioEngine.seek(target);
+      dispatchTransport({ type: 'position', positionStep: audioEngine.getPositionSteps() });
     },
-    [audioEngine, project.settings.timeSignature],
+    [audioEngine],
   );
 
   function handleToggleLoop() {
-    setLoopEnabled((current) => !current);
+    handleCommand({ type: 'playlist.loop.set', changes: { enabled: !projectRef.current.settings.loop.enabled } });
   }
 
   async function handleTestTone() {
@@ -355,7 +359,8 @@ export function App() {
       <TransportBar
         audioBusy={audioBusy}
         audioState={audioState}
-        cycleSteps={getTransportCycleSteps(project.settings.timeSignature)}
+        cycleSteps={getPlaybackRegion(project).endStep}
+        regionStartStep={getPlaybackRegion(project).startStep}
         history={history}
         loopEnabled={loopEnabled}
         onCommand={handleCommand}
@@ -398,16 +403,16 @@ export function App() {
             onSelectPattern={setSelectedPatternId}
             onToggle={() => togglePanel('channelRack')}
             pattern={pattern}
-            playbackActive={audioState.transportStatus === 'playing'}
+            playbackActive={patternPlaybackActive}
             project={project}
             sampleStatus={sampleStatus}
             selectedPatternId={pattern.id}
-            transport={transport}
+            transport={patternTransport}
           />
           <div className="middle-panels">
             <PianoRoll
               collapsed={collapsed.pianoRoll}
-              getPlayheadSteps={() => audioEngine.getPlayheadSteps()}
+              getPlayheadSteps={() => patternStepAtSongPosition(project, pattern.id, audioEngine.getPlayheadSteps(), selectedClipId) ?? 0}
               onCommand={handleCommand}
               onPreviewNote={(pitch, velocity) => {
                 const current = project.channels.find((item) => item.id === activeChannelId);
@@ -416,19 +421,32 @@ export function App() {
                   reportError('audio', error);
                 });
               }}
-              onSeek={handleSeek}
+              onSeek={(step) => handleSeek(songStepForPatternTick(project, pattern.id, step * TICKS_PER_STEP, audioEngine.getPlayheadSteps(), selectedClipId))}
               onSelectChannel={setSelectedChannelId}
               onToggle={() => togglePanel('pianoRoll')}
               pattern={pattern}
-              playbackActive={audioState.transportStatus === 'playing'}
+              playbackActive={patternPlaybackActive}
               project={project}
               selectedChannelId={activeChannelId}
-              transport={transport}
+              transport={patternTransport}
             />
             <Playlist
               collapsed={collapsed.playlist}
               onCommand={handleCommand}
               onToggle={() => togglePanel('playlist')}
+              onSeek={handleSeek}
+              onSelectPattern={setSelectedPatternId}
+              onSelectClip={setSelectedClipId}
+              onEditPattern={(patternId, clipId) => {
+                setSelectedPatternId(patternId);
+                setSelectedClipId(clipId);
+                setCollapsed((current) => ({ ...current, pianoRoll: false, channelRack: false }));
+                document.getElementById('panel-piano-roll')?.focus();
+              }}
+              onLoadAudio={handleLoadPlaylistAudio}
+              isAudioAssetLoaded={(assetId) => sampleStoreRef.current!.has(assetId)}
+              playbackActive={audioState.transportStatus === 'playing'}
+              getPlayheadSteps={() => audioEngine.getPlayheadSteps()}
               pattern={pattern}
               project={project}
               transport={transport}

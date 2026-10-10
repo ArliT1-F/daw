@@ -78,6 +78,8 @@ export class TransportClock {
   private parkedStep = 0;
   private anchorTime = 0;
   private anchorStep = 0;
+  private startHeadroomTime = 0;
+  private startHeadroomStep = 0;
   private cycleStartTime = 0;
   private iterationCount = 0;
   private tempoMapValue: TempoMap;
@@ -130,6 +132,7 @@ export class TransportClock {
   /** Musical position for a given audio-clock time. */
   positionAt(contextTime: number): number {
     if (this.currentStatus !== 'playing') return this.parkedStep;
+    if (contextTime < this.startHeadroomTime) return this.startHeadroomStep;
     const elapsedSeconds = contextTime - this.anchorTime;
     const anchorSeconds = secondsAtStep(this.tempoMapValue, this.timeSignatureValue, this.anchorStep);
     return Math.max(0, stepAtSeconds(this.tempoMapValue, this.timeSignatureValue, anchorSeconds + elapsedSeconds));
@@ -158,6 +161,8 @@ export class TransportClock {
     const from = this.clampToRegion(options.fromStep ?? this.loopState.startStep);
     const delay = Math.max(0, options.startDelay ?? 0);
     this.anchorTime = contextTime + delay;
+    this.startHeadroomTime = this.anchorTime;
+    this.startHeadroomStep = from;
     this.anchorStep = from;
     this.parkedStep = from;
     this.cycleStartTime = this.anchorTime - this.secondsBetweenSteps(this.loopState.startStep, from);
@@ -168,6 +173,7 @@ export class TransportClock {
   /** Freeze at the current position. */
   pause(contextTime: number): void {
     if (this.currentStatus !== 'playing') return;
+    this.syncCycles(contextTime);
     this.parkedStep = this.positionAt(contextTime);
     this.currentStatus = 'paused';
   }
@@ -184,6 +190,8 @@ export class TransportClock {
     this.parkedStep = this.loopState.startStep;
     this.anchorStep = this.parkedStep;
     this.anchorTime = 0;
+    this.startHeadroomTime = 0;
+    this.startHeadroomStep = this.parkedStep;
     this.cycleStartTime = 0;
     this.iterationCount = 0;
   }
@@ -193,6 +201,8 @@ export class TransportClock {
     const target = this.clampToRegion(step);
     if (this.currentStatus === 'playing') {
       this.anchorTime = contextTime;
+      this.startHeadroomTime = contextTime;
+      this.startHeadroomStep = target;
       this.anchorStep = target;
       this.parkedStep = target;
       this.cycleStartTime = contextTime - this.secondsBetweenSteps(this.loopState.startStep, target);
@@ -230,12 +240,15 @@ export class TransportClock {
 
   /** Change the loop region. The position is clamped into the new region and playback continues. */
   setLoop(loop: Partial<TransportLoopState>, contextTime: number): void {
-    this.loopState = normalizeLoop({ ...this.loopState, ...loop });
+    this.syncCycles(contextTime);
     const position = this.currentStatus === 'playing' ? this.positionAt(contextTime) : this.parkedStep;
+    this.loopState = normalizeLoop({ ...this.loopState, ...loop });
     const clamped = this.clampToRegion(position);
     this.parkedStep = clamped;
     if (this.currentStatus === 'playing') {
       this.anchorTime = contextTime;
+      this.startHeadroomTime = contextTime;
+      this.startHeadroomStep = clamped;
       this.anchorStep = clamped;
       this.cycleStartTime = contextTime - this.secondsBetweenSteps(this.loopState.startStep, clamped);
     } else {
@@ -284,6 +297,22 @@ export class TransportClock {
     return cycle.startTime + this.secondsBetweenSteps(cycle.startStep, step);
   }
 
+  /** Inverse timing for a particular pass, including tempo changes inside a window. */
+  stepForTime(cycle: TransportCycle, contextTime: number): number {
+    const origin = secondsAtStep(this.tempoMapValue, this.timeSignatureValue, cycle.startStep);
+    return stepAtSeconds(this.tempoMapValue, this.timeSignatureValue, origin + contextTime - cycle.startTime);
+  }
+
+  /** Draw the audible pass even when output latency reaches back across the last wrap. */
+  playheadAt(contextTime: number): number {
+    if (this.currentStatus !== 'playing' || !this.loopState.enabled || this.cycleDurationSeconds <= 0) return this.positionAt(contextTime);
+    if (contextTime < this.startHeadroomTime) return this.startHeadroomStep;
+    const duration = this.cycleDurationSeconds;
+    const elapsed = ((contextTime - this.cycleStartTime) % duration + duration) % duration;
+    const origin = secondsAtStep(this.tempoMapValue, this.timeSignatureValue, this.loopState.startStep);
+    return stepAtSeconds(this.tempoMapValue, this.timeSignatureValue, origin + elapsed);
+  }
+
   snapshot(contextTime: number): TransportSnapshot {
     const position = this.positionAt(contextTime);
     return {
@@ -312,6 +341,7 @@ export class TransportClock {
 
   /** Position at `contextTime` under the current mapping, or null when not playing. */
   private capturePosition(contextTime: number): number | null {
+    this.syncCycles(contextTime);
     return this.currentStatus === 'playing' ? this.positionAt(contextTime) : null;
   }
 
@@ -322,6 +352,8 @@ export class TransportClock {
     }
     const position = preservedPosition ?? this.positionAt(contextTime);
     this.anchorTime = contextTime;
+    this.startHeadroomTime = contextTime;
+    this.startHeadroomStep = position;
     this.anchorStep = position;
     this.parkedStep = position;
     this.cycleStartTime = contextTime - this.secondsBetweenSteps(this.loopState.startStep, position);

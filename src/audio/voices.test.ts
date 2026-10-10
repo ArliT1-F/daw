@@ -74,11 +74,18 @@ describe('voice creation', () => {
   it('gives very short notes a usable envelope instead of an inverted one', () => {
     const { fake, graph } = createPool();
     const voice = createVoice(timing(note, 0, 0.001), graph, () => {});
-    expect(voice?.endTime).toBeGreaterThan(0.05);
+    expect(voice?.endTime).toBeCloseTo(0.001 + 0.06 + 0.02, 9);
     const envelope = fake.gains.find((node) => node.gain.calls.length > 0);
     expect(envelope).toBeDefined();
     // The attack is shortened for a tiny note instead of running past its release.
     expect(envelope?.gain.calls[0].time).toBeLessThanOrEqual(0.001);
+  });
+
+  it('zero-velocity samples and notes create no audible or near-silent fallback voice', () => {
+    const { fake, graph } = createPool();
+    expect(createVoice(timing({ ...kick, velocity: 0 }, 0), graph, () => {})).toBeNull();
+    expect(createVoice(timing({ ...note, velocity: 0 }, 0, 1), graph, () => {})).toBeNull();
+    expect(fake.sources).toHaveLength(0);
   });
 
   it('returns null for unsupported event kinds', () => {
@@ -145,8 +152,8 @@ describe('voice pool', () => {
     expect(pool.activeCount).toBe(2);
 
     pool.cancelPendingFrom(2);
-    // The 3 s voice is cut back to its own start, so it never sounds.
-    expect(fake.oscillators[1].stopAt).toBeCloseTo(3 + VOICE_RELEASE_SECONDS, 6);
+    // The future source is stopped before its start, not left sounding for an 8 ms fade.
+    expect(fake.oscillators[1].stopAt).toBeLessThan(fake.oscillators[1].startedAt!);
     expect(fake.oscillators[0].stopAt).toBeCloseTo(1.34, 6);
   });
 

@@ -2,9 +2,10 @@ import type { LoopRange, TransportClockStatus } from '../core/transport/transpor
 import { TransportClock } from '../core/transport/transportClock';
 import type { TimeSignature } from '../core/project/model';
 import type { TempoMap } from '../core/time/musicalTime';
-import type { MusicalEvent, MusicalEventSink, ScheduledEventTiming } from '../core/events/musicalEvents';
+import type { MusicalEvent, MusicalEventSink, MusicalEventSource, ScheduledEventTiming } from '../core/events/musicalEvents';
+import { sampleOnsetKey } from '../core/events/musicalEvents';
 import { AudioGraph } from './AudioGraph';
-import { Scheduler, type SchedulerDiagnostics } from './scheduler';
+import { Scheduler, type SchedulerDiagnostics, type AudioContinuation } from './scheduler';
 import { VoicePool } from './voices';
 import { createBestAvailableTimer, type RepeatingTimer } from './timer';
 
@@ -109,6 +110,8 @@ export class BrowserAudioEngine implements AudioEngine, MusicalEventSink {
   private error: AudioEngineError | null = null;
   private unsupported = false;
   private disposed = false;
+  private scheduledSampleOnsets: Array<{ key: string; time: number; iteration: number }> = [];
+  private scheduledAudio: ScheduledEventTiming[] = [];
   private readonly listeners = new Set<(state: AudioEngineState) => void>();
 
   constructor(options: BrowserAudioEngineOptions = {}) {
@@ -205,6 +208,8 @@ export class BrowserAudioEngine implements AudioEngine, MusicalEventSink {
   async dispose(): Promise<void> {
     if (this.disposed) return;
     this.disposed = true;
+    this.scheduledSampleOnsets = [];
+    this.scheduledAudio = [];
     this.scheduler.dispose();
     this.timer.dispose();
     this.pool?.clear();
@@ -261,7 +266,9 @@ export class BrowserAudioEngine implements AudioEngine, MusicalEventSink {
       // Resume continues from the parked position; no offset, so the position never jumps back.
       this.transportClock.resume(now);
     } else {
-      this.transportClock.start(now, { startDelay: this.startDelaySeconds });
+      const loop = this.transportClock.loop;
+      const parked = this.transportClock.parkedPositionSteps;
+      this.transportClock.start(now, { fromStep: loop.enabled && parked >= loop.endStep ? loop.startStep : parked, startDelay: this.startDelaySeconds });
     }
     this.scheduler.reset();
     this.scheduler.seekToPosition(this.transportClock.parkedPositionSteps);
@@ -273,6 +280,8 @@ export class BrowserAudioEngine implements AudioEngine, MusicalEventSink {
 
   /** Freeze at the current position and release every sounding voice. */
   pause(): void {
+    this.scheduledSampleOnsets = [];
+    this.scheduledAudio = [];
     if (this.transportClock.status === 'playing') {
       this.transportClock.pause(this.now());
     }
@@ -283,6 +292,8 @@ export class BrowserAudioEngine implements AudioEngine, MusicalEventSink {
 
   /** Stop playback, release voices, and park at the region start. */
   stop(): void {
+    this.scheduledSampleOnsets = [];
+    this.scheduledAudio = [];
     const now = this.now();
     this.scheduler.stop();
     this.pool?.releaseAll(now);
@@ -298,11 +309,15 @@ export class BrowserAudioEngine implements AudioEngine, MusicalEventSink {
 
   /** Move the playhead to a step position. */
   seek(step: number): void {
+    this.scheduledSampleOnsets = [];
+    this.scheduledAudio = [];
     const now = this.now();
     const wasPlaying = this.transportClock.status === 'playing';
     this.scheduler.stop();
     this.pool?.releaseAll(now);
-    this.transportClock.seek(step, now);
+    this.transportClock.advanceTo(now);
+    const loop = this.transportClock.loop;
+    this.transportClock.seek(loop.enabled && step >= loop.endStep ? loop.startStep : step, now);
     this.scheduler.seekToPosition(this.transportClock.parkedPositionSteps);
     this.resumeScheduling(wasPlaying);
     this.emit();
@@ -312,7 +327,7 @@ export class BrowserAudioEngine implements AudioEngine, MusicalEventSink {
     this.reconfigure((now) => this.transportClock.setTempo(bpm, now));
   }
 
-  /** Replace the whole tempo map (future automation). */
+  /** Replace the saved, piecewise-constant song tempo map. */
   setTempoMap(changes: TempoMap): void {
     this.reconfigure((now) => this.transportClock.setTempoMap(changes, now));
   }
@@ -335,6 +350,20 @@ export class BrowserAudioEngine implements AudioEngine, MusicalEventSink {
     this.reconfigure((now) => this.scheduler.setEvents(events, hasContext ? now : undefined));
   }
 
+  /** Atomically replace the arrangement and all timing settings; refill only one lookahead. */
+  setArrangement(source: MusicalEventSource, settings: {
+    tempoMap: TempoMap;
+    timeSignature: TimeSignature;
+    loop: Partial<LoopRange> & { enabled: boolean };
+  }): void {
+    this.reconfigure((now) => {
+      this.transportClock.setTempoMap(settings.tempoMap, now);
+      this.transportClock.setTimeSignature(settings.timeSignature, now);
+      this.transportClock.setLoop(settings.loop, now);
+      this.scheduler.setEventSource(source);
+    });
+  }
+
   setChannelGain(channelId: string, gain: number): void {
     this.graph?.setChannelGain(channelId, gain);
   }
@@ -347,7 +376,9 @@ export class BrowserAudioEngine implements AudioEngine, MusicalEventSink {
 
   /** Musical position in steps for the current audio-clock time. */
   getPositionSteps(): number {
-    return this.transportClock.positionAt(this.now());
+    const now = this.now();
+    this.transportClock.advanceTo(now);
+    return this.transportClock.positionAt(now);
   }
 
   /**
@@ -357,7 +388,7 @@ export class BrowserAudioEngine implements AudioEngine, MusicalEventSink {
   getPlayheadSteps(): number {
     if (!this.context) return this.transportClock.parkedPositionSteps;
     const latency = this.getOutputLatencySeconds();
-    return this.transportClock.positionAt(Math.max(0, this.context.currentTime - latency));
+    return this.transportClock.playheadAt(Math.max(0, this.context.currentTime - latency));
   }
 
   getOutputLatencySeconds(): number {
@@ -404,6 +435,8 @@ export class BrowserAudioEngine implements AudioEngine, MusicalEventSink {
       throw new AudioEngineError(CLOSED_MESSAGE, 'context-closed');
     }
     try {
+      if (timing.event.kind === 'sample' && timing.event.velocity > 0) this.scheduledSampleOnsets.push({ key: sampleOnsetKey(timing.event), time: timing.time, iteration: timing.iteration });
+      if (timing.event.kind === 'audio') this.scheduledAudio.push(timing);
       this.pool.schedule(timing);
     } catch (error) {
       this.fail(error, 'scheduling-failed');
@@ -429,6 +462,8 @@ export class BrowserAudioEngine implements AudioEngine, MusicalEventSink {
       return false;
     }
     this.transportClock.syncCycles(now);
+    this.scheduledSampleOnsets = this.scheduledSampleOnsets.filter((onset) => onset.time >= now - 0.25);
+    this.scheduledAudio = this.scheduledAudio.filter((timing) => timing.time + timing.durationSeconds > now);
     return true;
   }
 
@@ -446,10 +481,32 @@ export class BrowserAudioEngine implements AudioEngine, MusicalEventSink {
   private reconfigure(applyChange: (now: number) => void): void {
     const now = this.now();
     const wasPlaying = this.transportClock.status === 'playing';
+    this.transportClock.advanceTo(now);
+    const outgoingPosition = this.transportClock.positionAt(now);
+    const outgoingIteration = this.transportClock.iteration;
+    // Only skip onsets that actually sounded. Pending downbeats and newly inserted clips must
+    // still play if an edit lands in startup headroom or exactly on a musical boundary.
+    const playedSamples = new Set(this.scheduledSampleOnsets.filter((onset) => onset.iteration === this.transportClock.iteration && onset.time <= now).map((onset) => onset.key));
+    const continuations = new Map<string, AudioContinuation>();
+    for (const timing of this.scheduledAudio) {
+      if (timing.event.kind === 'audio' && timing.time <= now && timing.time + timing.durationSeconds > now && timing.iteration === this.transportClock.iteration) {
+        continuations.set(timing.event.id, { event: timing.event, sourceOffsetSeconds: (timing.sourceOffsetSeconds ?? timing.event.sourceOffsetSeconds) + now - timing.time });
+      }
+    }
+    this.scheduledSampleOnsets = [];
+    this.scheduledAudio = [];
     this.scheduler.stop();
-    this.pool?.cancelPendingFrom(now);
+    // Mute/delete/trim edits and new tempo maps must also retire sounding sustained voices.
+    this.pool?.releaseAll(now);
     applyChange(now);
-    this.scheduler.seekToPosition(this.transportClock.positionAt(now));
+    this.transportClock.advanceTo(now);
+    const position = this.transportClock.positionAt(now);
+    if (Math.abs(position - outgoingPosition) > 1e-8 || outgoingIteration !== this.transportClock.iteration) {
+      // Loop edits can implicitly seek/wrap; they enter the new song position, not the old audio phase.
+      playedSamples.clear();
+      continuations.clear();
+    }
+    this.scheduler.seekToPosition(position, playedSamples, continuations);
     this.resumeScheduling(wasPlaying);
     this.emit();
   }
@@ -629,7 +686,11 @@ export class BrowserAudioEngine implements AudioEngine, MusicalEventSink {
     const engineError = toAudioEngineError(error, reason);
     this.error = engineError;
     if (engineError.reason === 'scheduling-failed') {
+      this.scheduledSampleOnsets = [];
+      this.scheduledAudio = [];
       this.scheduler.stop();
+      this.pool?.releaseAll(this.now());
+      this.transportClock.stop();
     }
     this.emit();
     return engineError;

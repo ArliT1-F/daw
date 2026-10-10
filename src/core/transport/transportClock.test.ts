@@ -256,3 +256,23 @@ describe('transport clock: snapshots', () => {
     expect(clock.syncCycles(50)).toBe(0);
   });
 });
+
+
+describe('transport edits after a timer stall', () => {
+  it('pauses at the wrapped position even if no scheduler tick synchronized the latest loop', () => {
+    const clock = createClock();
+    clock.start(0);
+    clock.pause(4.5);
+    expect(clock.parkedPositionSteps).toBe(4);
+    expect(clock.iteration).toBe(2);
+    clock.resume(10);
+    expect(clock.positionAt(10)).toBe(4);
+  });
+  it('tempo changes preserve the wrapped musical position after an unsynchronized loop boundary', () => {
+    const clock = createClock();
+    clock.start(0);
+    clock.setTempo(60, 2.5);
+    expect(clock.positionAt(2.5)).toBe(4);
+    expect(clock.positionAt(3)).toBe(6);
+  });
+});

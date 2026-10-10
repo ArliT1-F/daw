@@ -93,6 +93,14 @@ export class FakeOscillatorNode extends FakeAudioSourceNode {
 export class FakeBufferSourceNode extends FakeAudioSourceNode {
   buffer: FakeAudioBuffer | null = null;
   playbackRate = new FakeAudioParam(1);
+  offsetSeconds = 0;
+  durationSeconds: number | undefined;
+
+  override start(time = 0, offset = 0, duration?: number): void {
+    super.start(time);
+    this.offsetSeconds = offset;
+    this.durationSeconds = duration;
+  }
 }
 
 export class FakeGainNode extends FakeAudioNode {

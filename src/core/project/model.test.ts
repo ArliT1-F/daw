@@ -7,10 +7,10 @@ describe('versioned project model', () => {
     const project = createInitialProject();
 
     expect(() => assertValidProject(project)).not.toThrow();
-    expect(project.version).toBe(1);
+    expect(project.version).toBe(2);
     expect(project.channels).toHaveLength(4);
     expect(project.patterns[0].steps['channel-kick']).toHaveLength(16);
-    expect(project.playlist[0].patternId).toBe(project.patterns[0].id);
+    expect((project.playlist[0].kind === 'pattern' && project.playlist[0].patternId)).toBe(project.patterns[0].id);
   });
 
   it('round-trips project content through versioned JSON serialization', () => {
@@ -19,13 +19,13 @@ describe('versioned project model', () => {
     const decoded = deserializeProject(encoded);
 
     expect(decoded).toEqual(project);
-    expect(encoded).toContain('"version": 1');
+    expect(encoded).toContain('"version": 2');
   });
 
   it('rejects invalid JSON and unsupported project versions', () => {
     expect(() => deserializeProject('{not json')).toThrow('not valid JSON');
 
-    const unknownVersion = { ...createInitialProject(), version: 2 };
+    const unknownVersion = { ...createInitialProject(), version: 999 };
     expect(() => assertValidProject(unknownVersion)).toThrow(ProjectValidationError);
     expect(() => deserializeProject(JSON.stringify(unknownVersion))).toThrow('Unsupported project version');
   });

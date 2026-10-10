@@ -1,6 +1,6 @@
 # Gridline Audio
 
-Gridline Audio is a free-to-use, browser-first DAW foundation built with React, TypeScript, and Vite. It has an original dark workspace and a modular, single-application architecture. There is no backend, account system, payment processing, cloud storage, or desktop wrapper.
+Gridline Audio is a free-to-use, browser-first DAW built with React, TypeScript, and Vite. The Channel Rack, Piano Roll, and multitrack Playlist share one project and audio-clock transport. There is no backend, account system, payment processing, cloud storage, or desktop wrapper.
 
 ## Requirements
 
@@ -10,186 +10,156 @@ Gridline Audio is a free-to-use, browser-first DAW foundation built with React, 
 ## Install and run
 
 ```sh
-npm install
+npm ci
 npm run dev
 ```
 
-Vite prints the development URL. The server binds to all interfaces for hosted previews.
+Vite prints the development URL. Development and preview servers bind to all interfaces and accept hosted-preview origins.
 
 ## Checks
 
 ```sh
-npm test          # one-shot Vitest unit tests
-npm run typecheck # TypeScript check
-npm run build     # typecheck and optimized production build
-npm run preview   # serve the production build locally
+npm test           # Vitest unit, DOM, and engine integration tests
+npm run typecheck  # includes application, test suites, and browser-test configuration
+npm run build      # typecheck and optimized production build
+npm run preview    # serve the production build locally
 ```
+
+Browser acceptance tests require Chromium:
+
+```sh
+npx playwright install chromium
+npm run test:browser
+```
+
+Playwright starts or reuses the Vite development server on port 5173. Set `CHROMIUM_PATH` to use an existing compatible browser, or `PLAYLIST_BASE_URL` to use another **Vite development** server. The multi-instrument fixture test imports real source modules through Vite; it is not a production-static-server test. Browser recordings, traces, and reports are ignored by Git.
 
 ## Foundation map
 
-- `src/core/project` — versioned project types, validation, JSON serialization, and the `ProjectPersistence` interface. An IndexedDB adapter is intentionally deferred.
-- `src/core/commands` — typed immutable edits and bounded undo/redo history.
-- `src/core/time` — the musical time model: the sixteenth-note grid, bars/beats/subdivisions, and a tempo map that converts between step positions and seconds.
-- `src/core/events` — musical event data (sample triggers, sustained notes) plus the pure translation from project data to a playable event list.
-- `src/core/transport` — UI transport state and `TransportClock`, the single authority that maps audio-clock time to musical position.
-- `src/audio` — `BrowserAudioEngine` (context lifecycle, audio graph, voices), the lookahead `Scheduler`, the lookahead timer, and the `SampleStore` (runtime registry for decoded user samples; buffers never enter the project document).
-- `src/features` — focused UI modules for the transport, Channel Rack (step sequencer), Piano Roll, Playlist, Mixer, and asset browser.
+- `src/core/project` — versioned project types, validation, JSON serialization, v1→v2 migration, and the `ProjectPersistence` interface. An IndexedDB adapter is deferred.
+- `src/core/commands` — typed immutable edits, atomic command batches, and bounded undo/redo history.
+- `src/core/time` — integer ticks (96 PPQ), steps, bars/beats, snapping, and tempo-map integration/inversion.
+- `src/core/arrangement` — song regions, track/channel audibility, tempo maps, audio-length conversion, and source-local editor positions.
+- `src/core/events` — musical events and the indexed, window-queryable `ArrangementEventSource`. The flat builder remains an offline/test convenience, not the live playback path.
+- `src/core/transport` — UI transport state and `TransportClock`, the single authority mapping audio-clock time to musical position.
+- `src/audio` — `BrowserAudioEngine`, graph/voices, lookahead scheduler/timer, and the runtime `SampleStore`. Decoded buffers never enter the project document.
+- `src/features` — transport, Channel Rack, Piano Roll, Playlist, Mixer, and asset browser.
+- `tests/browser` — Playwright acceptance tests using real layout, pointer capture, file decoding, Worker timing, and Web Audio output.
 
-Project content, transient panel/selection state, transport position, persistence, and browser audio objects are kept in separate layers. Pattern steps with per-step velocities, piano-roll notes, tempo, swing, time signature, channel mute/solo/sample assignments, and arrangement clips are all serializable project data edited through undoable commands. The starter project is currently held in memory only.
+Project content, transient panel/selection state, transport position, persistence, and browser audio objects remain separate. The app currently holds its project in memory; JSON serialization is a core API, not a completed save/load UI.
+
+## Playlist — Phase 5
+
+### Arrangement workflow
+
+- Create tracks with **+ Track**. Rename the lane field, reorder with ↑/↓, and mute/solo with M/S. Lanes can contain both pattern and audio instances; they are independent of Channel Rack channels.
+- Choose a shared pattern or imported audio asset in the source selector. **Draw** places a clip at the clicked, snapped timeline position, including on occupied bars and other lanes. New pattern instances have the source pattern's length; extending the right edge repeats that source.
+- Click to select, drag the body to move across time/lanes, or drag an edge to resize/trim. The inspector also edits name, destination track, start beat, duration, and source trim; audio instances additionally expose source-start seconds and gain.
+- Shift or Ctrl/Cmd-click toggles selection. **Select** supports marquee selection. Move, resize, duplicate, delete, nudge, and copy/paste groups without cloning their patterns or decoded audio.
+- Alt-drag duplicates. Ctrl/Cmd+D duplicates the selected group, Ctrl/Cmd+C/V copies/pastes, Delete/Backspace removes, and arrow keys nudge in time/track order (Shift+horizontal arrow nudges a bar). Each committed gesture or group operation is one undo entry. Escape/pointer cancellation discards previews.
+- Snap choices include bar, beat, sixteenth, triplet, and one tick. Zoom and horizontal/vertical scrolling do not change musical positions. **+ 8 bars** extends empty editing space. Visible ruler/cells/clips are filtered to the viewport rather than creating a DOM element for every bar in a long song.
+- Pattern and audio clips have distinct colors, boundaries, names, and template/waveform previews. Overlapping instances occupy visible subrows rather than hiding each other.
+- **+ Audio** imports into the selected lane at the parked playhead; dropping a file on a lane imports at the drop position. WAV/MP3/OGG/FLAC/M4A and other browser-decodable audio formats are accepted. Channel Rack sample imports also become reusable Playlist audio assets, without a second decode.
+- Selecting a pattern instance chooses its shared source. Double-click opens the Piano Roll. Editing the Rack or Piano Roll updates every instance of that source, while their local playheads/seeks account for the selected instance's song start and trim.
+
+### Ruler, loops, and tempo
+
+Click the bar/beat ruler to seek. Drag loop handles, Shift-drag the ruler, or edit the loop's start/end fields to define a saved region. The end is exclusive; fractional bar positions are supported. Playlist and transport loop buttons control the same project setting.
+
+Loop-enabled playback stays within that region, even when it begins partway through existing clips. Seeking before its start clamps to the start; seeking at/after its exclusive end enters the start. With looping off, the active region is zero through the last clip end, with a one-bar minimum; unused loop markers and empty viewport extensions do not lengthen the song. Stop parks at the active region's start.
+
+The transport BPM field edits the **base** tempo. Enter a marker BPM and use **+ Tempo** to apply a saved tempo change at the snapped song playhead (at tick zero it edits the base). Markers are visible in the ruler; click a marker to remove it. Later markers override the base from their positions onward. Notes, loop lengths, and audio source-offset calculations integrate this piecewise-constant map.
+
+### Data and editing contract
+
+Project format **v2** stores:
+
+- reusable `patterns` and `audioAssets` separately from `playlist` instances;
+- independent tracks with stable IDs, names, colors, mute/solo, and array order;
+- each clip's stable ID, track ID, absolute `startTick`, positive `durationTicks`, and optional instance name;
+- pattern instances referencing `patternId` plus `sourceOffsetTicks`, or audio instances referencing `assetId` plus `sourceOffsetSeconds`/gain;
+- the saved loop and unique, sorted, positive-tick tempo markers.
+
+Validation checks references, safe integer positions/ranges, and asset/loop/tempo metadata. v1 JSON is migrated using its saved time signature, preserving pattern and clip IDs and creating a default lane/loop. Moving, resizing, or duplicating a clip does not duplicate its reusable source data. Audio asset metadata contains duration and bounded waveform peaks, **not PCM bytes**.
 
 ## Audio engine
 
 ### Ownership
 
-`BrowserAudioEngine` is the only component that touches Web Audio. It owns, in this order:
+`BrowserAudioEngine` owns:
 
-1. the `AudioContext` (created on the first user gesture, never before);
-2. the `AudioGraph` — channel buses → master gain → safety limiter → destination;
-3. the `VoicePool` — every sounding node, so a stop can release all of them;
-4. the `TransportClock` — musical position as a pure function of `context.currentTime`;
-5. the `Scheduler` — which events to queue, and when.
+1. the `AudioContext`, created on a user playback/preview/import action rather than mounting;
+2. the `AudioGraph`: channel buses → master gain → safety limiter → destination;
+3. the `VoicePool`, including sounding and future voices;
+4. the `TransportClock`;
+5. the lookahead `Scheduler`.
 
-Musical data never holds a node. The project model is translated once into plain `MusicalEvent`
-objects (`{ kind: 'sample' | 'note', step, channelId, … }`), and those objects are what the
-scheduler queues. A MIDI output or an offline renderer can implement the same `MusicalEventSink`
-interface later without touching the transport or the UI.
+The model holds no browser audio objects. Plain musical sample/note/audio events cross the `MusicalEventSource`/`MusicalEventSink` boundary. MIDI or offline renderers can use these contracts later without coupling the editors to Web Audio nodes.
 
-### Scheduling design
+### Window scheduling
 
-Sound timing comes from the audio clock only:
+- A timer wakes every **25 ms** (Worker when available, otherwise an interval). Each tick queries only the next **120 ms**, divided at loop boundaries, and schedules voices against `AudioContext.currentTime`.
+- The source compiles each used pattern once, indexes clip intervals, and expands only nearby repeats. Live playback never builds or schedules an entire song. A million-bar clip can be queried near its current playback position without expanding its earlier repeats.
+- Stable event IDs distinguish instance, repeat, channel, and note/step. Time-pruned deduplication records prevent a window overlap from replaying the same event, while a different overlapping clip intentionally gets a separate voice.
+- `setArrangement` applies source, tempo map, signature, and loop atomically: synchronize the old position, retire the previous queue/voices, apply settings, seek once, and refill once.
+- Rendering is not in the sound timing path. `requestAnimationFrame` reads the central, output-latency-compensated clock for the Playlist and source-local editor playheads.
+- Events more than **10 ms** late are dropped rather than bursting behind the clock. A long timer stall skips obsolete loops and chases only the current held notes/audio. Timing stays audio-clock accurate provided the main thread fills the lookahead before its deadline.
 
-- A timer wakes every **25 ms** (a `Worker` timer when available, `setInterval` as a fallback,
-  because browsers throttle background-tab timers to ~1 s and that would starve the queue).
-- Each tick queues every event that starts within the next **120 ms** (`lookaheadSeconds`),
-  scheduling each voice at its exact `AudioContext` time.
-- Rendering is never in the timing path. `requestAnimationFrame` only reads
-  `getPlayheadSteps()` to draw the playhead, so a slow frame cannot delay or duplicate a note.
+### Explicit playback semantics
 
-Consequences:
-
-- Timer jitter only changes how early events are queued, not when they sound. Events are
-  sample-accurate as long as a tick arrives before the lookahead window closes.
-- The lookahead is the real latency/budget trade-off: 120 ms is far more than a 25 ms tick, and
-  small enough that edits and tempo changes take effect almost immediately.
-- Events more than 10 ms late are dropped rather than fired behind the clock (`lateGraceSeconds`).
-  After a long stall the scheduler skips to the cycle containing the current time instead of
-  firing a burst of stale notes.
-
-### Musical time
-
-The atomic unit is the sixteenth-note step (16 steps per whole note). `TransportClock` stores an
-anchor `(anchorTime, anchorStep)` and a tempo map, and derives position as
-`stepAtSeconds(secondsAtStep(anchorStep) + (now - anchorTime))`. Every reconfiguration re-anchors
-at the current instant, which keeps floating-point error bounded to one loop and makes each
-operation's semantics explicit:
-
-| Operation | Semantics |
+| Situation | Behavior |
 | --- | --- |
-| `play` | Starts at the parked position with 60 ms of scheduling headroom, so the first event is never queued in the past. Initializes the `AudioContext` if needed — it is always called from a gesture. |
-| `pause` | Freezes the musical position and releases every sounding voice. |
-| `stop` | Releases every voice, parks at the region start, resets the loop iteration. |
-| `restart` | `stop()` then `play()`. |
-| `seek` | Moves the playhead, releases sounding voices, and re-cursors the scheduler. Playback continues from the new position; the current window is queued immediately so events at the target still sound. |
-| tempo / signature change | The musical position is preserved and only the rate changes. Already-queued voices are cancelled and re-cursored, so nothing sounds twice at two tempos. |
-| loop | The visible region wraps when looping is on; when it is off, playback stops at the region end. Notes are clamped at the boundary, so nothing hangs across a loop. |
+| Overlapping clips | Additive/polyphonic playback, even on the same lane or using the same source. Intentional overlaps are not deduplicated against each other. Track and channel mute/solo both apply; mute wins over solo. |
+| Play / resume | Begin at the parked position with 60 ms startup headroom. Held notes are retriggered for their remaining musical duration; audio starts at its trimmed source offset plus integrated elapsed song time. Earlier one-shot samples are not chased. |
+| Seek while playing | Cancel future voices before their onsets, release sounding voices, re-anchor, and immediately query the new position. Seeking inside a held note/audio clip works; an onset exactly at the target is eligible. |
+| Mid-song loop entry | Chase notes/audio already overlapping the loop start. Each pass is a new scheduling iteration. Notes and audio are capped at clip/loop boundaries, with no previous-pass tails crossing the boundary. |
+| Clip/track/source edits | Retire the stale queue and sounding sustained voices, then chase the updated current window. Only unchanged, already-sounded one-shot onsets in the current pass are suppressed; canceled future downbeats and newly inserted coincident clips remain eligible. |
+| Live tempo/meter changes | Preserve musical position. Reschedule note remainders and future onsets against the new map. Native audio already in flight preserves its actual file phase instead of jumping to a retroactive offset; explicit seeks, trim/onset/asset changes, and loop-induced position jumps re-resolve the source from the new song mapping. |
+| Native audio | Playback rate stays 1: no stretching or repitching. Duration is capped at the source EOF, musical clip end, and loop end. Extending beyond EOF creates silence, not a repeated file. A later seek/resume uses the current tempo map, which can differ from a stream continued through a live tempo edit. |
+| Pause | Synchronize loop wraps, freeze position, release voices, and cancel pending onsets. Resume chases the remainder at that position. |
+| Stop / song end | Stop scheduling, cancel future starts, release all voices, park at the active region start, and reset the iteration. |
+| Missing audio buffer | The instance is silent, visibly marked as missing, and never falls back to a synthesized drum. |
 
-### Failures
+Native audio boundaries use short fades; synths keep their normal release within the clip but are cut at clip/loop edges. Chased synth notes restart their envelopes rather than preserving an oscillator's old phase.
 
-`AudioEngineError` carries a classified `reason` (`unsupported`, `autoplay-blocked`,
-`device-unavailable`, `context-closed`, `scheduling-failed`, `unknown`) and a message written for
-users, not developers. The engine also watches `AudioContext.state`: a closed context tears the
-graph down, and an `interrupted` context (iOS/Safari) pauses transport and reports the failure.
+### Failures and timing limits
 
-### Timing limitations
+`AudioEngineError` classifies unsupported Web Audio, autoplay blocking, unavailable devices, closed contexts, and voice-creation failures. UI errors are visible; unavailable audio never animates a pretend playing transport. A scheduling failure stops/releases the engine.
 
-- **Output latency.** Events are sample-accurate on the audio clock, but they are *heard*
-  `outputLatency` later (typically 10–40 ms, far more over Bluetooth). The playhead compensates by
-  reading the position `outputLatency` in the past; the label in the transport bar reports the
-  measured value.
-- **Background tabs.** A `Worker` timer keeps the queue filled, but some browsers still throttle
-  or suspend audio when a tab is hidden for a long time. Recovery is automatic: late events are
-  dropped and the next cycle is picked up on time.
-- **Device changes.** Web Audio does not expose device selection; if the output device disappears
-  the context may go to `interrupted`/`closed`, which the engine surfaces as an error.
-- **Quantisation of the Channel Rack playhead.** The step sequencer highlights sixteenth-note
-  cells, so that playhead moves in steps (~8 times per second at 124 BPM) even though the audio
-  position is continuous. The piano roll draws a tick-accurate playhead from the same clock.
-- **No sample-accurate automation yet.** Tempo is constant per project (the tempo map supports
-  future automation); mixer faders and effects are still deferred.
+Output latency (typically 10–40 ms, more over Bluetooth) is reported and compensated in the visible playhead. Worker timers reduce background-tab starvation but cannot prevent all browser throttling, context suspension, or main-thread stalls. Web Audio offers no output-device selection. The Rack highlights sixteenth cells; the Playlist/Piano Roll draw continuous/tick-accurate positions from the same clock.
 
-## Testing
+Tempo markers are supported; mixer/effect parameter automation remains deferred.
 
-```sh
-npm test
-```
+## Verification
 
-221 tests cover the audio and editing layers:
+The implementation was actually checked with:
 
-- `src/core/time` — grid maths, integer-tick conversions (ticks ↔ steps ↔ bars/beats ↔ seconds),
-  tempo-map integration and inversion, bar/beat/sixteenth round-trips, odd signatures (6/8, 7/8,
-  12/8), snapping, loop-boundary duration, clamping, and formatting.
-- `src/core/events` — project → event translation (clip placement, pattern repeat, clip
-  truncation, tick-based piano-roll notes, notes truncated at clip/loop ends, sorting, unique ids,
-  velocity clamping) and event-list helpers.
-- `src/core/transport` — `TransportClock` start/pause/resume/stop/seek, tempo and signature
-  changes, loop wrapping (including many wraps drift-free and stalled clocks), cycle timing
-  across a loop boundary, and snapshots.
-- `src/audio/scheduler` — lookahead windowing, loop continuity, one-event-per-iteration,
-  out-of-range and late events, note clamping at the loop end, and re-cursoring after
-  seek/tempo/sequence changes.
-- `src/audio/AudioEngine` — lifecycle, autoplay and device failures, context interruption,
-  scheduled voice times, loop synchronisation over repeated passes, stop/pause/seek/restart,
-  sequence swaps, latency-compensated playhead, and diagnostics — plus two end-to-end tests that
-  play the starter project through the engine. The engine is tested against an injectable
-  `AudioContext` double (`src/audio/__fixtures__`), so no browser is required.
-- `src/audio/voices` — voice construction, envelopes, pool cancellation and release.
-- `src/audio/timer` — interval timer behaviour and the worker fallback.
-- `src/App.audio.test.tsx` — the React wiring in a DOM: mounting never touches audio, play
-  schedules voices, stop releases them, and the loop toggle and test tone work.
-- `src/features/piano-roll` — note create/select/delete/copy/paste, velocity, snapping,
-  serialization of integer ticks, and playhead/note alignment across tempo changes.
-- `src/core/commands/pianoRoll.test.ts` — undoable add/update/remove/replace of tick-based notes.
+- **`npm test`: 26 files, 317 tests passed.** Includes the existing Channel Rack and Piano Roll suites, arrangement commands/history and serialization/migration, source-window boundaries and shared-instance IDs, Playlist gestures/group edits, and App integration.
+- **`npm run typecheck`: passed**, including the browser test code/configuration.
+- **`npm run build`: passed**, producing the production bundle.
+- **`npm run test:browser`: 5 Chromium tests passed.** These cover real cross-lane pointer movement/resizing, selection/history/shared-source opening, later-bar scroll/zoom/seek, decoded/trimmed audio, mid-song looping with tempo automation, multi-instrument overlapping playback, and a narrow viewport.
+- Browser audio checks used the real Web Audio graph and measured a nonzero master-output signal during playback and silence after stop. Fixture assertions checked distinct instruments/instances, tempo-aware onsets, audio offsets/durations, and no repeated `(event ID, iteration)` pairs. **This is automated signal verification, not a human listening test.**
+
+The shared fixture in `src/core/arrangement/__fixtures__/testArrangement.ts` combines phase-shifted shared patterns, two pitched instruments, one audio asset, a step 24–56 loop, and 120→90→150 BPM markers. Additional engine regressions cover editing during startup headroom, exact lookahead edges, zero-velocity/retimed-onset suppression, separator-safe event identities, live native-audio phase continuity, exclusive-loop-end seeks, loop edits that implicitly seek, one-tick loops at 300 BPM, missing assets, stopping, and stalls.
+
+The injectable Web Audio double makes exact timing and future-voice cancellation assertions deterministic. Playwright separately exercises real browser layout, decoding, timers, voices, and output; Vitest never discovers the browser suite.
 
 ## Channel Rack
 
-The Channel Rack is a real step sequencer wired to the scheduler:
-
-- 16/32-step patterns with per-step toggling and per-step velocity (click/wheel/arrow keys, plus a
-  dedicated velocity painting mode for touch), pattern add/duplicate/rename/clear and selection.
-- BPM (transport bar) and swing (rack) are project settings; every event is quantized to the
-  sixteenth-note grid and scheduled on the audio clock, so tempo changes re-anchor playback
-  without drift.
-- Channel mute/solo are applied when project events are built, so activity lights and the step
-  playhead always reflect the events the scheduler actually queues — indicators only move while
-  the engine is genuinely playing.
-- User samples load per channel through the file picker or drag-and-drop (WAV/MP3/OGG/FLAC/M4A
-  and other `audio/*` types the browser can decode), with visible loading and per-row error states;
-  a preview button auditions the channel. Decoded buffers live in the runtime `SampleStore`, keyed
-  by a stable `sampleId` stored on the channel.
+- 16/32-step patterns with per-step toggling and velocity (click/wheel/arrow keys plus touch-friendly velocity painting), pattern add/duplicate/rename/clear, and selection.
+- BPM and swing are project settings. Pattern playback is now instanced through the Playlist, not a second concurrent sequencer queue.
+- Channel mute/solo filters the same arrangement event source.
+- File picker or drag/drop sample loading with loading/error states and preview. Decoded buffers live once in `SampleStore`; the channel and Playlist assets reference that shared runtime ID.
 
 ## Piano Roll
 
-The Piano Roll is a tick-accurate MIDI editor wired to the same project model and scheduler:
-
-- Keyboard on the vertical axis (MIDI 0–127) and a bar/beat grid on the horizontal axis, with
-  horizontal/vertical scroll, H/V zoom, and a playhead driven by the audio clock.
-- Draw and Select tools: create, select, move, resize, duplicate, multi-select (shift / marquee),
-  and delete notes. Copy/paste, quantize, and note-length presets are in the toolbar.
-- Grid snapping to straight and triplet subdivisions (including 1/64 and off / 1-tick). All note
-  positions and durations are stored as integer ticks (96 PPQ) so repeated edits cannot accumulate
-  floating-point error.
-- Velocity per note, with a dedicated velocity lane.
-- Notes that start inside a clip or loop and extend past its end are truncated at the boundary;
-  they do not wrap into the next iteration. Pattern notes themselves always lie inside the pattern.
-- Instrument channels preview pitches from the keyboard and while drawing/moving notes. The
-  built-in synth voice is the only pitched instrument; no extra instrument collection is bundled.
+- MIDI 0–127 keyboard and tick-accurate bar/beat grid, horizontal/vertical scrolling/zoom, and an audio-clock playhead.
+- Draw/Select, move/resize/duplicate/multi-select/delete, copy/paste/quantize, note-length presets, and velocity lane.
+- Straight/triplet snapping, 1/64 and one-tick editing. Notes remain integer ticks (96 PPQ), so repeated edits cannot accumulate position error.
+- Instrument pitch preview and the built-in synth. Notes crossing clip/loop ends are truncated, not wrapped. Editing a shared pattern affects all its instances.
 
 ## Current limits
 
-The engine plays the starter kit plus user-loaded samples: the built-in drum kit and synth are
-synthesised placeholders (no bundled sample assets), channels have no inserts, and the mixer has
-no faders. Loaded samples are session-only (buffers are not persisted with the project file yet).
-Master metering, IndexedDB persistence, project import/export, effects, and plugin hosting remain
-deferred and labeled in the UI. Drum lanes and sample-loaded lanes trigger from the Channel Rack
-step grid; instrument lanes play piano-roll notes. No external fonts, assets, or network services
-are required.
+Loaded audio is **session-only**. JSON keeps asset IDs, names, duration, and waveform metadata, but not decoded buffers or original file bytes. There is no persistent audio relink workflow yet. Refreshing the app also resets the in-memory project; save/load UI and IndexedDB persistence remain deferred.
+
+The drum kit and pitched synth are synthesized placeholders, with no bundled audio library. There is no time stretching, audio consolidation/export, mixer faders/inserts, master metering, plugin hosting, or effect automation. Deferred features are labeled in the UI. No external fonts, bundled media downloads, or network services are needed for the app itself.
