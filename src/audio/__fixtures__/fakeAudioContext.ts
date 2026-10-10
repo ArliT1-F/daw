@@ -52,15 +52,42 @@ export class FakeAudioParam {
 }
 
 export class FakeAudioNode {
+  /** Outgoing connections, in the order they were made. Duplicate entries are kept, so a test can
+   *  detect a signal path that was connected twice. */
   readonly connections: FakeAudioNode[] = [];
 
-  connect(destination: FakeAudioNode): FakeAudioNode {
+  connect(destination: FakeAudioNode, _outputIndex = 0, _inputIndex = 0): FakeAudioNode {
     this.connections.push(destination);
     return destination;
   }
 
-  disconnect(): void {
-    this.connections.length = 0;
+  disconnect(destination?: FakeAudioNode): void {
+    if (!destination) {
+      this.connections.length = 0;
+      return;
+    }
+    const index = this.connections.lastIndexOf(destination);
+    if (index >= 0) this.connections.splice(index, 1);
+  }
+
+  /** Number of outgoing connections. */
+  get connectionCount(): number {
+    return this.connections.length;
+  }
+
+  /** True when this node reaches `target` through any chain of connections. */
+  reaches(target: FakeAudioNode, seen = new Set<FakeAudioNode>()): boolean {
+    if (seen.has(this)) return false;
+    seen.add(this);
+    for (const next of this.connections) {
+      if (next === target || next.reaches(target, seen)) return true;
+    }
+    return false;
+  }
+
+  /** True when following connections from this node can return to it. */
+  get hasFeedbackPath(): boolean {
+    return this.reaches(this);
   }
 }
 
@@ -122,6 +149,52 @@ export class FakeDynamicsCompressorNode extends FakeAudioNode {
   release = new FakeAudioParam(0.25);
 }
 
+export class FakeStereoPannerNode extends FakeAudioNode {
+  pan = new FakeAudioParam(0);
+}
+
+/**
+ * Analyser double. `amplitude` sets the peak of a synthetic sine the node hands out, so meter tests
+ * are deterministic: peak equals `amplitude` and RMS equals `amplitude / sqrt(2)`.
+ */
+export class FakeAnalyserNode extends FakeAudioNode {
+  fftSize = 2048;
+  smoothingTimeConstant = 0.8;
+  amplitude = 0;
+  /** Number of times the meter polled this node. */
+  readCount = 0;
+
+  get frequencyBinCount(): number {
+    return this.fftSize / 2;
+  }
+
+  getFloatTimeDomainData(array: Float32Array<ArrayBuffer>): void {
+    this.readCount += 1;
+    for (let index = 0; index < array.length; index += 1) {
+      array[index] = this.amplitude * Math.sin((2 * Math.PI * index) / 32);
+    }
+  }
+
+  getByteTimeDomainData(array: Uint8Array<ArrayBuffer>): void {
+    this.readCount += 1;
+    for (let index = 0; index < array.length; index += 1) {
+      array[index] = Math.round(128 + 127 * this.amplitude * Math.sin((2 * Math.PI * index) / 32));
+    }
+  }
+}
+
+export class FakeChannelMergerNode extends FakeAudioNode {
+  constructor(readonly inputs = 1) {
+    super();
+  }
+}
+
+export class FakeChannelSplitterNode extends FakeAudioNode {
+  constructor(readonly outputs = 1) {
+    super();
+  }
+}
+
 export class FakeAudioBuffer {
   private readonly channels: Float32Array[] = [];
 
@@ -146,6 +219,8 @@ export interface FakeContextOptions {
   /** Start in the running state, as a context resumed inside a user gesture would. */
   startRunning?: boolean;
   sampleRate?: number;
+  /** Set false to simulate a context without `StereoPannerNode` and exercise the panner fallback. */
+  supportsStereoPanner?: boolean;
 }
 
 export class FakeAudioContext {
@@ -161,6 +236,12 @@ export class FakeAudioContext {
   readonly bufferSources: FakeBufferSourceNode[] = [];
   readonly filters: FakeBiquadFilterNode[] = [];
   readonly compressors: FakeDynamicsCompressorNode[] = [];
+  readonly stereoPanners: FakeStereoPannerNode[] = [];
+  readonly analysers: FakeAnalyserNode[] = [];
+  readonly mergers: FakeChannelMergerNode[] = [];
+  readonly splitters: FakeChannelSplitterNode[] = [];
+  /** Absent (not merely unused) when the context does not support stereo panning. */
+  readonly createStereoPanner: (() => FakeStereoPannerNode) | undefined;
   resumeCount = 0;
   suspendCount = 0;
   closeCount = 0;
@@ -173,6 +254,22 @@ export class FakeAudioContext {
   constructor(options: FakeContextOptions = {}) {
     this.sampleRate = options.sampleRate ?? 48000;
     if (options.startRunning) this.state = 'running';
+    this.createStereoPanner = options.supportsStereoPanner === false
+      ? undefined
+      : () => {
+          const node = new FakeStereoPannerNode();
+          this.stereoPanners.push(node);
+          return node;
+        };
+  }
+
+  /** Total number of nodes the context handed out, used to prove a graph was not rebuilt. */
+  get nodeCount(): number {
+    return (
+      this.gains.length + this.oscillators.length + this.bufferSources.length + this.filters.length +
+      this.compressors.length + this.stereoPanners.length + this.analysers.length +
+      this.mergers.length + this.splitters.length
+    );
   }
 
   async decodeAudioData(_data: ArrayBuffer): Promise<FakeAudioBuffer> {
@@ -267,6 +364,24 @@ export class FakeAudioContext {
   createDynamicsCompressor(): FakeDynamicsCompressorNode {
     const node = new FakeDynamicsCompressorNode();
     this.compressors.push(node);
+    return node;
+  }
+
+  createAnalyser(): FakeAnalyserNode {
+    const node = new FakeAnalyserNode();
+    this.analysers.push(node);
+    return node;
+  }
+
+  createChannelMerger(inputs = 1): FakeChannelMergerNode {
+    const node = new FakeChannelMergerNode(inputs);
+    this.mergers.push(node);
+    return node;
+  }
+
+  createChannelSplitter(outputs = 1): FakeChannelSplitterNode {
+    const node = new FakeChannelSplitterNode(outputs);
+    this.splitters.push(node);
     return node;
   }
 

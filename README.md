@@ -42,7 +42,8 @@ Playwright starts or reuses the Vite development server on port 5173. Set `CHROM
 - `src/core/arrangement` — song regions, track/channel audibility, tempo maps, audio-length conversion, and source-local editor positions.
 - `src/core/events` — musical events and the indexed, window-queryable `ArrangementEventSource`. The flat builder remains an offline/test convenience, not the live playback path.
 - `src/core/transport` — UI transport state and `TransportClock`, the single authority mapping audio-clock time to musical position.
-- `src/audio` — `BrowserAudioEngine`, graph/voices, lookahead scheduler/timer, and the runtime `SampleStore`. Decoded buffers never enter the project document.
+- `src/audio` — `BrowserAudioEngine`, graph/voices, mixer buses and metering, lookahead scheduler/timer, and the runtime `SampleStore`. Decoded buffers never enter the project document.
+- `src/core/mixer` — pure mixer model: dB/pan/meter maths, source routing, cycle detection, mute/solo resolution, and the audio-facing `MixerState`.
 - `src/features` — transport, Channel Rack, Piano Roll, Playlist, Mixer, and asset browser.
 - `tests/browser` — Playwright acceptance tests using real layout, pointer capture, file decoding, Worker timing, and Web Audio output.
 
@@ -89,7 +90,7 @@ Validation checks references, safe integer positions/ranges, and asset/loop/temp
 `BrowserAudioEngine` owns:
 
 1. the `AudioContext`, created on a user playback/preview/import action rather than mounting;
-2. the `AudioGraph`: channel buses → master gain → safety limiter → destination;
+2. the `AudioGraph`: source strips → mixer buses → master bus → safety limiter → destination;
 3. the `VoicePool`, including sounding and future voices;
 4. the `TransportClock`;
 5. the lookahead `Scheduler`.
@@ -128,17 +129,17 @@ Native audio boundaries use short fades; synths keep their normal release within
 
 Output latency (typically 10–40 ms, more over Bluetooth) is reported and compensated in the visible playhead. Worker timers reduce background-tab starvation but cannot prevent all browser throttling, context suspension, or main-thread stalls. Web Audio offers no output-device selection. The Rack highlights sixteenth cells; the Playlist/Piano Roll draw continuous/tick-accurate positions from the same clock.
 
-Tempo markers are supported; mixer/effect parameter automation remains deferred.
+Tempo markers are supported. Mixer faders, pan, mute/solo, routing, and metering are live; per-parameter effect automation remains deferred.
 
 ## Verification
 
 The implementation was actually checked with:
 
-- **`npm test`: 26 files, 317 tests passed.** Includes the existing Channel Rack and Piano Roll suites, arrangement commands/history and serialization/migration, source-window boundaries and shared-instance IDs, Playlist gestures/group edits, and App integration.
+- **`npm test`: 36 files, 444 tests passed.** Includes the existing Channel Rack, Piano Roll, Playlist, and engine suites, plus the Phase 6 additions: mixer model maths/routing/cycle detection and signatures, mixer commands and history coalescing, mixer serialization and v2→v3 migration, mixer-graph topology/diff/dispose, meter ballistics and bank, mixer playback routing and lifecycle, the Mixer panel UI, and App mixer wiring.
 - **`npm run typecheck`: passed**, including the browser test code/configuration.
 - **`npm run build`: passed**, producing the production bundle.
-- **`npm run test:browser`: 5 Chromium tests passed.** These cover real cross-lane pointer movement/resizing, selection/history/shared-source opening, later-bar scroll/zoom/seek, decoded/trimmed audio, mid-song looping with tempo automation, multi-instrument overlapping playback, and a narrow viewport.
-- Browser audio checks used the real Web Audio graph and measured a nonzero master-output signal during playback and silence after stop. Fixture assertions checked distinct instruments/instances, tempo-aware onsets, audio offsets/durations, and no repeated `(event ID, iteration)` pairs. **This is automated signal verification, not a human listening test.**
+- **`npm run test:browser`: 9 Chromium specs** (5 Playlist + 4 Mixer). The mixer specs measure the real master-output signal and assert the master fader gates it, insert mute/solo gate it before the master bus, rerouting keeps it audible, and the meters go live while playing. Requires `npx playwright install chromium`.
+- Browser audio checks use the real Web Audio graph and measure a nonzero master-output signal during playback and silence after stop. Fixture assertions check distinct instruments/instances, tempo-aware onsets, audio offsets/durations, and no repeated `(event ID, iteration)` pairs. **This is automated signal verification, not a human listening test.**
 
 The shared fixture in `src/core/arrangement/__fixtures__/testArrangement.ts` combines phase-shifted shared patterns, two pitched instruments, one audio asset, a step 24–56 loop, and 120→90→150 BPM markers. Additional engine regressions cover editing during startup headroom, exact lookahead edges, zero-velocity/retimed-onset suppression, separator-safe event identities, live native-audio phase continuity, exclusive-loop-end seeks, loop edits that implicitly seek, one-tick loops at 300 BPM, missing assets, stopping, and stalls.
 
@@ -158,8 +159,36 @@ The injectable Web Audio double makes exact timing and future-voice cancellation
 - Straight/triplet snapping, 1/64 and one-tick editing. Notes remain integer ticks (96 PPQ), so repeated edits cannot accumulate position error.
 - Instrument pitch preview and the built-in synth. Notes crossing clip/loop ends are truncated, not wrapped. Editing a shared pattern affects all its instances.
 
+## Mixer — Phase 6
+
+### Signal flow
+
+```
+voices → source strip → mixer bus (effect slots → fader → pan → meter) → … → master bus → limiter → output
+```
+
+- Every Channel Rack channel and every Playlist track is a **source strip** with exactly one send target, so no source can reach the master twice or through two paths. Playlist audio clips route by track (`audio:<trackId>`); pattern/sample voices route by their rack channel.
+- Each **mixer bus** carries a stable effect-slot chain (a unity bypass until Phase 7), a dB **fader** (-60…+12 dB), a **pan** control (StereoPannerNode, with an equal-power fallback), and an in-line **analyser** for metering. Mute/solo are implemented as a smooth gain gate on the bus, never as a disconnect, so gating can't bypass the master.
+- The **master bus** has a fader and an output meter, is pinned last, cannot be rerouted, and always feeds the safety limiter and the hardware output. `syncMixer` never touches that connection.
+
+### Routing rules
+
+- A bus routes to the master bus or to another insert; the destination graph must stay **acyclic** and every insert must reach the master. Self-routes, cycles, missing destinations, and rerouting the master are rejected by the model, the commands, and the graph (which falls back to the master and reports a warning rather than dangling or feeding back).
+- Channel ordering is stable (master first), and inserts can be reordered. Removing a bus splices its feeders onto its own destination instead of dropping them.
+- Track-to-mixer assignment is editable per source from each strip; sources default to the master bus.
+
+### Correctness and performance
+
+- All fader/pan/mute/route changes are `setTargetAtTime` ramps (fast constant for gates), so there are no clicks. A single-setting change touches exactly one `AudioParam` or one connection — the graph is never rebuilt and sounding voices are never restarted. Mixer edits are diffed against the live graph; an identical state is a no-op.
+- Mixer edits use a separate `mixerStateSignature` than the arrangement, so moving a fader never rebuilds the event source or releases held notes. Conversely, `arrangementSignature` excludes mixer state, so the two sync paths never interfere.
+- Meters poll the analysers at a bounded ~20 Hz via `requestAnimationFrame` (paused in a hidden tab) and write straight into bound DOM nodes with peak-hold/clip-latch ballistics — no React re-render per tick.
+
+### Persistence
+
+Mixer channels (name, role, fader, pan, mute/solo, destination, and prepared effect slots) and track/channel assignments are part of the versioned project document (**v3**, migrated from v2/v1). Every mixer edit is an undoable command and round-trips through JSON.
+
 ## Current limits
 
 Loaded audio is **session-only**. JSON keeps asset IDs, names, duration, and waveform metadata, but not decoded buffers or original file bytes. There is no persistent audio relink workflow yet. Refreshing the app also resets the in-memory project; save/load UI and IndexedDB persistence remain deferred.
 
-The drum kit and pitched synth are synthesized placeholders, with no bundled audio library. There is no time stretching, audio consolidation/export, mixer faders/inserts, master metering, plugin hosting, or effect automation. Deferred features are labeled in the UI. No external fonts, bundled media downloads, or network services are needed for the app itself.
+The drum kit and pitched synth are synthesized placeholders, with no bundled audio library. There is no time stretching, audio consolidation/export, plugin hosting, or effect automation. The mixer's effect slots are wired as unity bypasses: they validate, persist, and reserve a stable chain position, but no processor runs yet. Deferred features are labeled in the UI. No external fonts, bundled media downloads, or network services are needed for the app itself.

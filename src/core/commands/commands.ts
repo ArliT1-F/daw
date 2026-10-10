@@ -1,6 +1,7 @@
 import {
   DEFAULT_PATTERN_STEPS,
   DEFAULT_STEP_VELOCITY,
+  MASTER_MIXER_CHANNEL_ID,
   SUPPORTED_PATTERN_LENGTHS,
   type Channel,
   type Note,
@@ -11,11 +12,13 @@ import {
 } from '../project/model';
 import { patternLengthTicks } from '../time/ticks';
 import { applyArrangementCommand, type ArrangementCommand } from './arrangementCommands';
+import { applyMixerCommand, type MixerCommand } from './mixerCommands';
 import { ProjectCommandError } from './commandError';
 export { ProjectCommandError } from './commandError';
 
 export type ProjectCommand =
   | ArrangementCommand
+  | MixerCommand
   | { type: 'project.batch'; commands: ProjectCommand[] }
   | { type: 'project.tempo.set'; tempo: number }
   | { type: 'project.swing.set'; swing: number }
@@ -486,6 +489,20 @@ export function applyProjectCommand(project: Project, command: ProjectCommand): 
     case 'project.tempo-changes.set':
       return applyArrangementCommand(project, command);
 
+    case 'mixer.channel.add':
+    case 'mixer.channel.rename':
+    case 'mixer.channel.remove':
+    case 'mixer.channel.reorder':
+    case 'mixer.channel.volume.set':
+    case 'mixer.channel.pan.set':
+    case 'mixer.channel.mute.set':
+    case 'mixer.channel.solo.set':
+    case 'mixer.channel.route':
+    case 'mixer.channel.effect.set':
+    case 'mixer.solo.clear':
+    case 'mixer.source.assign':
+      return applyMixerCommand(project, command);
+
     default: {
       const exhaustiveCheck: never = command;
       return exhaustiveCheck;
@@ -497,10 +514,17 @@ export interface ProjectHistoryState {
   project: Project;
   past: Project[];
   future: Project[];
+  /**
+   * Key of the gesture the last command belonged to, or null. A drag (a mixer fader, a pan control,
+   * a clip move) emits many commands; only the first one pushes the pre-gesture project onto the
+   * undo stack, so one gesture stays one undo entry.
+   */
+  coalesceKey: string | null;
 }
 
 export type ProjectHistoryAction =
-  | { type: 'command'; command: ProjectCommand }
+  /** `coalesceKey` continues the current gesture instead of starting a new undo entry. */
+  | { type: 'command'; command: ProjectCommand; coalesceKey?: string }
   | { type: 'undo' }
   | { type: 'redo' }
   | { type: 'replace'; project: Project };
@@ -508,7 +532,7 @@ export type ProjectHistoryAction =
 export const MAX_UNDO_STEPS = 100;
 
 export function createProjectHistory(project: Project): ProjectHistoryState {
-  return { project, past: [], future: [] };
+  return { project, past: [], future: [], coalesceKey: null };
 }
 
 export function projectHistoryReducer(state: ProjectHistoryState, action: ProjectHistoryAction): ProjectHistoryState {
@@ -516,10 +540,12 @@ export function projectHistoryReducer(state: ProjectHistoryState, action: Projec
     case 'command': {
       const project = applyProjectCommand(state.project, action.command);
       if (project === state.project) return state;
+      const coalescing = action.coalesceKey !== undefined && action.coalesceKey === state.coalesceKey;
       return {
         project,
-        past: [...state.past, state.project].slice(-MAX_UNDO_STEPS),
+        past: coalescing ? state.past : [...state.past, state.project].slice(-MAX_UNDO_STEPS),
         future: [],
+        coalesceKey: action.coalesceKey ?? null,
       };
     }
     case 'undo': {
@@ -529,6 +555,7 @@ export function projectHistoryReducer(state: ProjectHistoryState, action: Projec
         project: previous,
         past: state.past.slice(0, -1),
         future: [state.project, ...state.future].slice(0, MAX_UNDO_STEPS),
+        coalesceKey: null,
       };
     }
     case 'redo': {
@@ -538,6 +565,7 @@ export function projectHistoryReducer(state: ProjectHistoryState, action: Projec
         project: next,
         past: [...state.past, state.project].slice(-MAX_UNDO_STEPS),
         future: state.future.slice(1),
+        coalesceKey: null,
       };
     }
     case 'replace':
@@ -553,7 +581,8 @@ export function createEmptyChannel(
   id: string,
   name: string,
   color: string,
-  mixerChannelId = 'mixer-insert-1',
+  /** Mixer bus a new channel is routed to; the master bus is always a valid destination. */
+  mixerChannelId = MASTER_MIXER_CHANNEL_ID,
   kind: Channel['kind'] = 'instrument',
 ): Channel {
   return { id, name, kind, color, mixerChannelId, muted: false, solo: false };
