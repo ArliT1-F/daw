@@ -322,7 +322,7 @@ describe('live arrangement scheduling', () => {
     project.patterns[0].velocities['channel-kick'][0] = 0;
     const h = harness(project);
     await h.engine.play();
-    expect(h.fake.oscillators).toHaveLength(10); // three note voices + only the nonzero-velocity kick
+    expect(h.fake.oscillators).toHaveLength(7); // three two-oscillator note voices + only the nonzero-velocity kick
     const before = h.records.length;
     h.configure(applyProjectCommand(project, { type: 'pattern.step.set', patternId: 'pattern-main', channelId: 'channel-kick', step: 0, active: true, velocity: 1 }));
     const hits = h.records.slice(before).filter((timing) => timing.event.kind === 'sample');

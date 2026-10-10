@@ -3,10 +3,12 @@ import { createStableId } from '../core/project/model';
 /**
  * Runtime registry for decoded user samples.
  *
- * Decoded `AudioBuffer`s are browser audio objects and never enter the project document; the
- * project only stores a stable `sampleId` plus a display name on each channel. The store keeps
- * the buffers in memory for the session, exposes per-load error reporting, and resolves ids for
- * the voice builder through `get`.
+ * Decoded `AudioBuffer`s are browser audio objects and never enter the project document. The
+ * project stores a stable asset id plus metadata (name, duration, format, and a content hash) on
+ * each asset. The store keeps one buffer per id for the session:
+ *  - importing bytes that are already loaded reuses the existing buffer without decoding again;
+ *  - a file whose hash matches a project asset that has lost its buffer is relinked to that id;
+ *  - voices resolve ids through `get`, and a missing id is reported as missing, never substituted.
  */
 
 export interface LoadedSample {
@@ -14,6 +16,14 @@ export interface LoadedSample {
   name: string;
   buffer: AudioBuffer;
   durationSeconds: number;
+  /** Identity of the file's bytes, such as `sha256:<hex>`. */
+  contentHash: string;
+  /** Lower-case extension, or the MIME type when the name has none. */
+  format: string;
+  bytes: number;
+  /** Decoded sample rate, or 0 when the browser did not report one. */
+  sampleRate: number;
+  channels: number;
 }
 
 /** Anything File-like, so tests can pass plain objects. */
@@ -25,6 +35,8 @@ export interface SampleFile {
 }
 
 export type SampleDecodeFunction = (data: ArrayBuffer) => Promise<AudioBuffer>;
+/** Hashes the raw bytes of a file. Injectable so tests and older browsers can supply their own. */
+export type ContentHasher = (data: ArrayBuffer) => Promise<string>;
 
 export class SampleLoadError extends Error {
   constructor(message: string, options?: { cause?: unknown }) {
@@ -48,8 +60,49 @@ function quoted(name: string): string {
   return `“${name}”`;
 }
 
-/** Validate + decode + store one file under a pre-generated stable id. */
-export async function loadSampleFile(id: string, file: SampleFile, decode: SampleDecodeFunction): Promise<LoadedSample> {
+function fileFormat(name: string, type?: string): string {
+  if (name.includes('.')) return name.split('.').pop()!.toLowerCase();
+  return (type ?? 'unknown').toLowerCase();
+}
+
+function toHex(bytes: ArrayBuffer): string {
+  return Array.from(new Uint8Array(bytes), (byte) => byte.toString(16).padStart(2, '0')).join('');
+}
+
+/** FNV-1a, 32-bit. A fallback for hosts without SubtleCrypto; identifies files, not secrets. */
+function fnv1a32(data: ArrayBuffer): string {
+  let hash = 0x811c9dc5;
+  const bytes = new Uint8Array(data);
+  for (let index = 0; index < bytes.length; index += 1) {
+    hash ^= bytes[index];
+    hash = Math.imul(hash, 0x01000193) >>> 0;
+  }
+  return (hash >>> 0).toString(16).padStart(8, '0');
+}
+
+/** Default content hash: SHA-256 when SubtleCrypto exists, otherwise FNV-1a 32-bit. */
+export const defaultContentHasher: ContentHasher = async (data) => {
+  const subtle = (globalThis as { crypto?: Crypto }).crypto?.subtle;
+  if (subtle) {
+    try {
+      return `sha256:${toHex(await subtle.digest('SHA-256', data))}`;
+    } catch {
+      /* fall through to the non-cryptographic identity */
+    }
+  }
+  return `fnv1a32:${fnv1a32(data)}`;
+};
+
+export interface PreparedSampleFile {
+  name: string;
+  format: string;
+  bytes: number;
+  data: ArrayBuffer;
+  contentHash: string;
+}
+
+/** Validate and read one file, and hash its bytes. Decoding is a separate step. */
+export async function readSampleFile(file: SampleFile, hasher: ContentHasher = defaultContentHasher): Promise<PreparedSampleFile> {
   const name = file.name?.trim();
   if (!name) throw new SampleLoadError('The file has no name.');
   if (!isSupportedAudioFile(name, file.type)) {
@@ -71,39 +124,101 @@ export async function loadSampleFile(id: string, file: SampleFile, decode: Sampl
   if (!data || data.byteLength === 0) {
     throw new SampleLoadError(`${quoted(name)} is empty.`);
   }
+  const contentHash = await hasher(data);
+  return { name, format: fileFormat(name, file.type), bytes: data.byteLength, data, contentHash };
+}
 
+async function decodePrepared(prepared: PreparedSampleFile, decode: SampleDecodeFunction): Promise<AudioBuffer> {
+  const quotedName = quoted(prepared.name);
   let buffer: AudioBuffer;
   try {
-    buffer = await decode(data);
+    buffer = await decode(prepared.data);
   } catch (error) {
     throw new SampleLoadError(
-      `${quoted(name)} could not be decoded. The format may not be supported by this browser.`,
+      `${quotedName} could not be decoded. The format may not be supported by this browser; try exporting it as WAV.`,
       { cause: error },
     );
   }
   if (!buffer || typeof buffer.length !== 'number' || buffer.length === 0) {
-    throw new SampleLoadError(`${quoted(name)} decoded to empty audio.`);
+    throw new SampleLoadError(`${quotedName} decoded to empty audio.`);
   }
+  return buffer;
+}
 
+function toLoadedSample(id: string, prepared: PreparedSampleFile, buffer: AudioBuffer): LoadedSample {
   const durationSeconds = Number.isFinite(buffer.duration) ? buffer.duration : 0;
-  return { id, name, buffer, durationSeconds };
+  return {
+    id,
+    name: prepared.name,
+    buffer,
+    durationSeconds,
+    contentHash: prepared.contentHash,
+    format: prepared.format,
+    bytes: prepared.bytes,
+    sampleRate: Number.isFinite(buffer.sampleRate) ? buffer.sampleRate : 0,
+    channels: Number.isFinite(buffer.numberOfChannels) && buffer.numberOfChannels > 0 ? buffer.numberOfChannels : 1,
+  };
+}
+
+/** Validate + decode + store one file under a pre-generated stable id. */
+export async function loadSampleFile(
+  id: string,
+  file: SampleFile,
+  decode: SampleDecodeFunction,
+  hasher: ContentHasher = defaultContentHasher,
+): Promise<LoadedSample> {
+  const prepared = await readSampleFile(file, hasher);
+  const buffer = await decodePrepared(prepared, decode);
+  return toLoadedSample(id, prepared, buffer);
+}
+
+export interface SampleImportOptions {
+  /**
+   * Maps a content hash to an asset id that should own the decoded buffer. Used to relink a
+   * missing project asset to a re-imported file instead of creating a duplicate asset.
+   */
+  assetIdForHash?: (contentHash: string) => string | undefined;
+}
+
+export interface SampleImportResult {
+  sample: LoadedSample;
+  /** True when identical bytes were already decoded, so no new buffer was created. */
+  reused: boolean;
 }
 
 export class SampleStore {
   private readonly samples = new Map<string, LoadedSample>();
+  private readonly idsByHash = new Map<string, string>();
 
-  constructor(private readonly decode: SampleDecodeFunction) {}
+  constructor(
+    private readonly decode: SampleDecodeFunction,
+    private readonly hasher: ContentHasher = defaultContentHasher,
+  ) {}
 
-  /** Decode `file` and register it under a fresh stable id. */
-  async add(file: SampleFile): Promise<LoadedSample> {
-    const sample = await loadSampleFile(createStableId('sample'), file, this.decode);
-    this.samples.set(sample.id, sample);
-    return sample;
+  /** Import a file, reusing an already-decoded buffer for identical bytes. */
+  async import(file: SampleFile, options: SampleImportOptions = {}): Promise<SampleImportResult> {
+    const prepared = await readSampleFile(file, this.hasher);
+    const knownId = this.idsByHash.get(prepared.contentHash);
+    const known = knownId ? this.samples.get(knownId) : undefined;
+    if (known) return { sample: known, reused: true };
+
+    const requestedId = options.assetIdForHash?.(prepared.contentHash);
+    const id = requestedId && !this.samples.has(requestedId) ? requestedId : createStableId('sample');
+    const buffer = await decodePrepared(prepared, this.decode);
+    const sample = toLoadedSample(id, prepared, buffer);
+    this.set(sample);
+    return { sample, reused: false };
   }
 
-  /** Re-register an already-validated id (used when a channel command is retried). */
+  /** Decode `file` and register it under a fresh (or reused, identical-content) stable id. */
+  async add(file: SampleFile): Promise<LoadedSample> {
+    return (await this.import(file)).sample;
+  }
+
+  /** Register an already-validated sample (used when a command is retried). */
   set(sample: LoadedSample): void {
     this.samples.set(sample.id, sample);
+    if (sample.contentHash) this.idsByHash.set(sample.contentHash, sample.id);
   }
 
   get(id: string | undefined): AudioBuffer | null {
@@ -119,12 +234,31 @@ export class SampleStore {
     return this.samples.has(id);
   }
 
+  /** The loaded sample that holds these exact bytes, if any. */
+  findByHash(contentHash: string): LoadedSample | null {
+    const id = this.idsByHash.get(contentHash);
+    return id ? this.samples.get(id) ?? null : null;
+  }
+
   size(): number {
     return this.samples.size;
   }
 
+  /** Approximate decoded PCM bytes held, each buffer counted once. For diagnostics. */
+  totalDecodedBytes(): number {
+    let total = 0;
+    const seen = new Set<AudioBuffer>();
+    for (const sample of this.samples.values()) {
+      if (seen.has(sample.buffer)) continue;
+      seen.add(sample.buffer);
+      total += sample.buffer.length * Math.max(1, sample.buffer.numberOfChannels || 1) * 4;
+    }
+    return total;
+  }
+
   clear(): void {
     this.samples.clear();
+    this.idsByHash.clear();
   }
 }
 

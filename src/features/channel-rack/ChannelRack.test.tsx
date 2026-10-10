@@ -41,6 +41,7 @@ function Harness({
   const [project, setProject] = useState<Project>(() => initialProject ?? createInitialProject());
   const projectRef = useRef(project);
   const [selectedPatternId, setSelectedPatternId] = useState('pattern-main');
+  const [selectedChannelId, setSelectedChannelId] = useState(project.channels[0]?.id ?? '');
 
   function handleCommand(command: ProjectCommand): boolean {
     recorded.push(command);
@@ -71,6 +72,10 @@ function Harness({
       project={project}
       sampleStatus={sampleStatus}
       selectedPatternId={pattern.id}
+      selectedChannelId={selectedChannelId}
+      onSelectChannel={setSelectedChannelId}
+      isAssetLoaded={() => true}
+      onAssignAsset={() => {}}
       transport={{ status: transportPlaying ? 'playing' : 'stopped', positionStep }}
     />
   );

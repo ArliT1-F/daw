@@ -8,7 +8,8 @@ import { AudioGraph, type MixerGraphStats } from './AudioGraph';
 import type { MixerState } from '../core/mixer/mixerModel';
 import type { MeterReading } from './metering';
 import { Scheduler, type SchedulerDiagnostics, type AudioContinuation } from './scheduler';
-import { VoicePool } from './voices';
+import { VoicePool, type ChannelVoiceSettings } from './voices';
+import type { Channel } from '../core/project/model';
 import { createBestAvailableTimer, type RepeatingTimer } from './timer';
 
 /**
@@ -116,6 +117,8 @@ export class BrowserAudioEngine implements AudioEngine, MusicalEventSink {
   private scheduledAudio: ScheduledEventTiming[] = [];
   /** Mixer settings requested before a context exists; applied when the graph is attached. */
   private mixerState: MixerState | null = null;
+  /** Live per-channel sample region and synth patch, read at voice-build time. */
+  private channelVoices = new Map<string, ChannelVoiceSettings>();
   private readonly listeners = new Set<(state: AudioEngineState) => void>();
 
   constructor(options: BrowserAudioEngineOptions = {}) {
@@ -431,6 +434,33 @@ export class BrowserAudioEngine implements AudioEngine, MusicalEventSink {
     this.graph.syncMixer(this.mixerState, { canPruneStrips: (this.pool?.activeCount ?? 0) === 0 });
   }
 
+  /**
+   * Replace the per-channel playback settings (assigned sample, sample region and gain, synth
+   * patch). These are read whenever a voice is built, so changes apply to the next note or
+   * trigger. They never rebuild the arrangement and never cut a sounding voice.
+   */
+  setChannelVoices(channels: readonly Channel[]): void {
+    const next = new Map<string, ChannelVoiceSettings>();
+    for (const channel of channels) {
+      next.set(channel.id, {
+        sampleId: channel.sampleId,
+        sampleTrim: channel.sampleTrim,
+        synth: channel.synth?.params,
+      });
+    }
+    this.channelVoices = next;
+  }
+
+  /** The playback settings currently applied to a channel; null for an unknown channel. */
+  getChannelVoices(channelId: string): ChannelVoiceSettings | null {
+    return this.channelVoices.get(channelId) ?? null;
+  }
+
+  /** Number of voices the pool currently tracks; a diagnostic for polyphony limits. */
+  get activeVoiceCount(): number {
+    return this.pool?.activeCount ?? 0;
+  }
+
   // ---------------------------------------------------------------- positions
 
   /** Musical position in steps for the current audio-clock time. */
@@ -630,6 +660,7 @@ export class BrowserAudioEngine implements AudioEngine, MusicalEventSink {
       this.graph,
       (error) => this.fail(error, 'scheduling-failed'),
       this.resolveSample,
+      (channelId) => this.channelVoices.get(channelId) ?? null,
     );
     context.onstatechange = () => this.handleContextStateChange();
     // Mixer settings requested before the first gesture are applied to the fresh graph.
@@ -688,6 +719,32 @@ export class BrowserAudioEngine implements AudioEngine, MusicalEventSink {
         step: 0,
         channelId,
         sampleId,
+        velocity: 0.9,
+      },
+      time,
+      durationSeconds: 0,
+      iteration: 0,
+    });
+    this.emit();
+  }
+
+  /**
+   * Preview a whole loaded asset (library audition). Refuses a missing asset instead of letting a
+   * synthesized drum stand in for it.
+   */
+  async auditionAsset(assetId: string, channelId = 'audition'): Promise<void> {
+    if (!this.resolveSample?.(assetId)) {
+      throw new AudioEngineError('This sample is missing from the session. Import the file again to restore it.', 'unknown');
+    }
+    const context = await this.ensureContext();
+    const time = context.currentTime + 0.02;
+    this.scheduleEvent({
+      event: {
+        kind: 'sample',
+        id: `audition-asset:${assetId}:${time}`,
+        step: 0,
+        channelId,
+        sampleId: assetId,
         velocity: 0.9,
       },
       time,

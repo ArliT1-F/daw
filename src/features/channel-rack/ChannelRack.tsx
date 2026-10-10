@@ -15,6 +15,8 @@ import { DEFAULT_STEP_VELOCITY, createStableId, type Pattern, type Project } fro
 import type { TransportState } from '../../core/transport';
 import { Icon } from '../../components/Icon';
 import { PanelFrame } from '../../components/PanelFrame';
+import { createChannelSynth } from '../../core/instruments/synthModel';
+import { ASSET_DRAG_TYPE } from '../browser/SampleLibrary';
 
 /** Runtime loading state for the sample assigned to a channel. Never part of the project. */
 export interface ChannelSampleStatus {
@@ -41,6 +43,13 @@ interface ChannelRackProps {
   onLoadSample: (channelId: string, file: File) => void;
   onDismissSampleError: (channelId: string) => void;
   onPreviewChannel: (channelId: string) => void;
+  /** Selected channel: the Piano Roll edits it and the Browser inspects it. */
+  selectedChannelId: string;
+  onSelectChannel: (channelId: string) => void;
+  /** False when the channel's asset is referenced by the project but not decoded in this session. */
+  isAssetLoaded: (assetId: string) => boolean;
+  /** Assigns a library asset dragged from the Browser onto a channel row. */
+  onAssignAsset: (channelId: string, assetId: string) => void;
 }
 
 const CHANNEL_COLORS = ['#7fa8d8', '#c9a26a', '#b98bd9', '#6fc3a8', '#d88b8b', '#9fc36f'];
@@ -65,6 +74,10 @@ export function ChannelRack({
   onLoadSample,
   onDismissSampleError,
   onPreviewChannel,
+  selectedChannelId,
+  onSelectChannel,
+  isAssetLoaded,
+  onAssignAsset,
 }: ChannelRackProps) {
   const [velocityMode, setVelocityMode] = useState(false);
   const [nameDrafts, setNameDrafts] = useState<Record<string, string>>({});
@@ -156,6 +169,21 @@ export function ChannelRack({
     });
   }
 
+  function addSynthChannel() {
+    const index = project.channels.length;
+    const id = createStableId('channel');
+    const channel = createEmptyChannel(
+      id,
+      `Synth ${index + 1}`,
+      CHANNEL_COLORS[index % CHANNEL_COLORS.length],
+      'mixer-insert-1',
+      'instrument',
+    );
+    if (onCommand({ type: 'channel.add', channel: { ...channel, synth: createChannelSynth() } })) {
+      onSelectChannel(id);
+    }
+  }
+
   function addPattern() {
     const id = createStableId('pattern');
     const name = `Pattern ${String(project.patterns.length + 1).padStart(2, '0')}`;
@@ -224,6 +252,13 @@ export function ChannelRack({
   function handleDrop(channelId: string, event: ReactDragEvent) {
     event.preventDefault();
     setDragOverChannelId(null);
+    // A library row carries an asset id; an OS file is decoded and imported first.
+    const carriesAsset = Array.from(event.dataTransfer?.types ?? []).includes(ASSET_DRAG_TYPE);
+    const assetId = carriesAsset ? event.dataTransfer.getData(ASSET_DRAG_TYPE) : '';
+    if (assetId) {
+      onAssignAsset(channelId, assetId);
+      return;
+    }
     const file = event.dataTransfer?.files?.[0];
     if (file) onLoadSample(channelId, file);
   }
@@ -268,6 +303,9 @@ export function ChannelRack({
       </button>
       <button aria-label="Add channel" className="button button--quiet add-channel-button" onClick={addChannel} type="button">
         <Icon name="plus" size={13} /> Add channel
+      </button>
+      <button aria-label="Add synth channel" className="button button--quiet" onClick={addSynthChannel} title="Add a channel that plays the built-in synthesizer" type="button">
+        <Icon name="plus" size={13} /> Add synth
       </button>
     </div>
   );
@@ -348,9 +386,13 @@ export function ChannelRack({
           const audible = !channel.muted && (!anySolo || channel.solo);
           const activity = playbackActive && audible && (activityAtStep.get(currentStep)?.has(channel.id) ?? false);
           const isDropTarget = dragOverChannelId === channel.id;
+          const isSelected = selectedChannelId === channel.id;
+          const sampleMissing = Boolean(channel.sampleId) && !isAssetLoaded(channel.sampleId!);
+          const sampleAsset = channel.sampleId ? project.audioAssets.find((asset) => asset.id === channel.sampleId) : undefined;
           return (
             <div
-              className={`rack-channel-block ${isDropTarget ? 'rack-channel-block--drop' : ''} ${audible ? '' : 'rack-channel-block--silent'}`}
+              aria-current={isSelected ? 'true' : undefined}
+              className={`rack-channel-block ${isDropTarget ? 'rack-channel-block--drop' : ''} ${audible ? '' : 'rack-channel-block--silent'} ${isSelected ? 'rack-channel-block--selected' : ''}`}
               key={channel.id}
               onDragLeave={() => setDragOverChannelId((current) => (current === channel.id ? null : current))}
               onDragOver={(event) => {
@@ -360,7 +402,7 @@ export function ChannelRack({
               onDrop={(event) => handleDrop(channel.id, event)}
             >
               <div className="rack-grid rack-channel-row" style={gridStyle}>
-                <div className="rack-channel-info">
+                <div className="rack-channel-info" onPointerDown={() => onSelectChannel(channel.id)}>
                   <button
                     aria-label={`${channel.muted ? 'Unmute' : 'Mute'} ${channel.name}`}
                     aria-pressed={channel.muted}
@@ -402,7 +444,10 @@ export function ChannelRack({
                       <span className="rack-sample-name">LOADING…</span>
                     </span>
                   ) : channel.sampleName ? (
-                    <span className="rack-sample-chip" title={channel.sampleName}>
+                    <span
+                      className={`rack-sample-chip ${sampleMissing ? 'rack-sample-chip--missing' : ''}`}
+                      title={sampleMissing ? `${channel.sampleName} is missing from this session. Import the same file to relink it.` : `${channel.sampleName}${sampleAsset ? ` · ${sampleAsset.durationSeconds.toFixed(3)} s` : ''}`}
+                    >
                       <span className="rack-sample-name">{channel.sampleName}</span>
                       <button
                         aria-label={`Remove loaded sample from ${channel.name}`}

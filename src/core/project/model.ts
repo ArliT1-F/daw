@@ -1,4 +1,5 @@
 import { TICKS_PER_STEP } from '../time/ticks';
+import { assertValidChannelSynth, createChannelSynth, type ChannelSynth } from '../instruments/synthModel';
 
 export const PROJECT_FORMAT = 'gridline-project' as const;
 export const PROJECT_VERSION = 3 as const;
@@ -76,7 +77,24 @@ export interface Channel {
   sampleId?: string;
   /** Display name of the loaded sample file. */
   sampleName?: string;
+  /**
+   * Start, end, and gain for the assigned sample. Absent = the whole sample at unity gain. Applied
+   * when a sample voice is built, so editing it never rebuilds the arrangement.
+   */
+  sampleTrim?: SampleTrim;
+  /** Built-in synthesizer state, used by instrument channels. Absent = the default patch. */
+  synth?: ChannelSynth;
 }
+
+/** Sample region and gain for one channel. Times are in seconds of the decoded source. */
+export interface SampleTrim {
+  startSeconds: number;
+  endSeconds: number;
+  /** Linear gain, 0..SAMPLE_GAIN_MAX. */
+  gain: number;
+}
+
+export const SAMPLE_GAIN_MAX = 2;
 
 export interface Note {
   id: string;
@@ -123,6 +141,17 @@ export interface AudioAsset {
   durationSeconds: number;
   /** Small peak envelope for the Playlist preview, not encoded/decoded audio. */
   peaks?: number[];
+  /**
+   * Identity of the file's bytes, such as `sha256:<hex>`. Re-importing identical bytes reuses the
+   * decoded buffer, and a missing asset can be relinked from a file with the same hash.
+   */
+  contentHash?: string;
+  /** Lower-case file extension or MIME type that was imported. */
+  format?: string;
+  /** Size of the imported file in bytes. */
+  bytes?: number;
+  sampleRate?: number;
+  channels?: number;
 }
 
 interface PlaylistClipBase {
@@ -323,6 +352,10 @@ export function assertValidProject(value: unknown): asserts value is Project {
     if (channel.sampleName !== undefined) {
       ensure(typeof channel.sampleName === 'string' && channel.sampleName.trim().length > 0, 'Channel sample name must be a non-empty string.');
     }
+    if (channel.synth !== undefined) {
+      ensure(channel.kind === 'instrument', `Channel ${String(channel.name)} has synth settings but is not an instrument.`);
+      assertValidChannelSynth(channel.synth);
+    }
   }
   ensureUniqueIds(channels as Array<{ id: string }>, 'Channel');
   const channelIds = new Set(channels.map((channel) => String((channel as Record<string, unknown>).id)));
@@ -396,9 +429,30 @@ export function assertValidProject(value: unknown): asserts value is Project {
     if (asset.peaks !== undefined) {
       ensure(Array.isArray(asset.peaks) && asset.peaks.length <= 256 && asset.peaks.every((peak) => Number.isFinite(peak) && Number(peak) >= 0 && Number(peak) <= 1), 'Audio asset peaks are invalid.');
     }
+    if (asset.contentHash !== undefined) {
+      ensure(typeof asset.contentHash === 'string' && /^[a-z0-9]+:[0-9a-f]+$/.test(asset.contentHash), 'Audio asset content hash is invalid.');
+    }
+    if (asset.format !== undefined) {
+      ensure(typeof asset.format === 'string' && asset.format.length > 0 && asset.format.length <= 64, 'Audio asset format is invalid.');
+    }
+    if (asset.bytes !== undefined) {
+      ensure(Number.isSafeInteger(asset.bytes) && Number(asset.bytes) >= 0, 'Audio asset size is invalid.');
+    }
+    if (asset.sampleRate !== undefined) {
+      ensure(Number.isFinite(asset.sampleRate) && Number(asset.sampleRate) >= 1000 && Number(asset.sampleRate) <= 768000, 'Audio asset sample rate is invalid.');
+    }
+    if (asset.channels !== undefined) {
+      ensure(Number.isInteger(asset.channels) && Number(asset.channels) >= 1 && Number(asset.channels) <= 32, 'Audio asset channel count is invalid.');
+    }
   }
   ensureUniqueIds(value.audioAssets as Array<{ id: string }>, 'Audio asset');
   const assetsById = new Map((value.audioAssets as AudioAsset[]).map((asset) => [asset.id, asset]));
+  for (const channel of channels as Array<Record<string, unknown>>) {
+    if (channel.sampleTrim === undefined) continue;
+    ensure(typeof channel.sampleId === 'string', `Channel ${String(channel.name)} has sample trim without a sample.`);
+    const asset = assetsById.get(String(channel.sampleId));
+    assertValidSampleTrim(channel.sampleTrim, asset?.durationSeconds, String(channel.name));
+  }
   const patternsById = new Map((patterns as Pattern[]).map((pattern) => [pattern.id, pattern]));
   for (const clip of playlist) {
     ensure(isRecord(clip), 'Playlist clip data must be an object.');
@@ -423,6 +477,21 @@ export function assertValidProject(value: unknown): asserts value is Project {
     }
   }
   ensureUniqueIds(playlist as Array<{ id: string }>, 'Playlist clip');
+}
+
+/**
+ * Validate a sample region. A known duration bounds the end; `undefined` means the asset is not in
+ * the project yet, so only the shape is checked.
+ */
+export function assertValidSampleTrim(value: unknown, durationSeconds: number | undefined, label: string): asserts value is SampleTrim {
+  ensure(isRecord(value), `Sample trim for ${label} must be an object.`);
+  const { startSeconds, endSeconds, gain } = value;
+  ensure(Number.isFinite(startSeconds) && Number(startSeconds) >= 0, `Sample start for ${label} must be zero or more seconds.`);
+  ensure(Number.isFinite(endSeconds) && Number(endSeconds) > Number(startSeconds), `Sample end for ${label} must be after its start.`);
+  if (durationSeconds !== undefined) {
+    ensure(Number(endSeconds) <= durationSeconds + 1e-9, `Sample end for ${label} is past the end of the sample.`);
+  }
+  ensure(Number.isFinite(gain) && Number(gain) >= 0 && Number(gain) <= SAMPLE_GAIN_MAX, `Sample gain for ${label} must be between 0 and ${SAMPLE_GAIN_MAX}.`);
 }
 
 /** Validate one mixer channel's prepared effect-slot chain. Slots are data only until Phase 7. */
@@ -547,7 +616,7 @@ export function createInitialProject(): Project {
     { id: 'channel-kick', name: 'Kick', kind: 'drum', color: '#e6a75c', mixerChannelId: 'mixer-insert-1', muted: false, solo: false },
     { id: 'channel-snare', name: 'Snare', kind: 'drum', color: '#e67872', mixerChannelId: 'mixer-insert-2', muted: false, solo: false },
     { id: 'channel-hat', name: 'Closed Hat', kind: 'drum', color: '#79c89b', mixerChannelId: 'mixer-insert-3', muted: false, solo: false },
-    { id: 'channel-bass', name: 'Soft Synth', kind: 'instrument', color: '#9992e8', mixerChannelId: 'mixer-insert-4', muted: false, solo: false },
+    { id: 'channel-bass', name: 'Soft Synth', kind: 'instrument', color: '#9992e8', mixerChannelId: 'mixer-insert-4', muted: false, solo: false, synth: createChannelSynth() },
   ];
   const notes: Record<string, Note[]> = Object.fromEntries(channels.map((channel) => [channel.id, []]));
   notes['channel-bass'] = [

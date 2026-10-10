@@ -11,6 +11,8 @@ import {
   isValidTimeSignature,
 } from '../project/model';
 import { patternLengthTicks } from '../time/ticks';
+import { assertValidChannelSynth, type ChannelSynth } from '../instruments/synthModel';
+import { assertValidSampleTrim, type SampleTrim } from '../project/model';
 import { applyArrangementCommand, type ArrangementCommand } from './arrangementCommands';
 import { applyMixerCommand, type MixerCommand } from './mixerCommands';
 import { ProjectCommandError } from './commandError';
@@ -29,6 +31,10 @@ export type ProjectCommand =
   | { type: 'channel.solo.set'; channelId: string; solo: boolean }
   | { type: 'channel.sample.assign'; channelId: string; sampleId: string; sampleName: string }
   | { type: 'channel.sample.clear'; channelId: string }
+  /** `trim: null` restores the whole sample at unity gain. */
+  | { type: 'channel.sample.trim.set'; channelId: string; trim: SampleTrim | null }
+  /** `synth: null` removes the channel's stored synth state, reverting to the default patch. */
+  | { type: 'channel.synth.set'; channelId: string; synth: ChannelSynth | null }
   | { type: 'pattern.add'; pattern: Pattern }
   | { type: 'pattern.rename'; patternId: string; name: string }
   | { type: 'pattern.duplicate'; patternId: string; newPatternId: string; name?: string }
@@ -61,6 +67,25 @@ function cloneNotes(notes: Record<string, Note[]>): Record<string, Note[]> {
 function requireChannel(project: Project, channelId: string): void {
   if (!project.channels.some((channel) => channel.id === channelId)) {
     throw new ProjectCommandError(`Channel "${channelId}" does not exist.`);
+  }
+}
+
+function requireChannelRecord(project: Project, channelId: string): Channel {
+  const channel = project.channels.find((item) => item.id === channelId);
+  if (!channel) throw new ProjectCommandError(`Channel "${channelId}" does not exist.`);
+  return channel;
+}
+
+function withoutSampleTrim(channel: Channel): Channel {
+  const { sampleTrim: _trim, ...rest } = channel;
+  return rest;
+}
+
+function validateChannelSynth(synth: ChannelSynth): void {
+  try {
+    assertValidChannelSynth(synth);
+  } catch (error) {
+    throw new ProjectCommandError(error instanceof Error ? error.message : 'Invalid synth settings.');
   }
 }
 
@@ -211,6 +236,10 @@ export function applyProjectCommand(project: Project, command: ProjectCommand): 
       if (!project.mixerChannels.some((item) => item.id === channel.mixerChannelId)) {
         throw new ProjectCommandError(`Mixer channel "${channel.mixerChannelId}" does not exist.`);
       }
+      if (channel.synth !== undefined) {
+        if (channel.kind !== 'instrument') throw new ProjectCommandError('Only instrument channels can have synth settings.');
+        validateChannelSynth(channel.synth);
+      }
       const channels = [...project.channels, { ...channel }];
       const patterns = project.patterns.map((pattern) => ({
         ...pattern,
@@ -260,22 +289,63 @@ export function applyProjectCommand(project: Project, command: ProjectCommand): 
       const sampleId = command.sampleId.trim();
       const sampleName = requireName(command.sampleName, 'Sample name');
       if (!sampleId) throw new ProjectCommandError('A sample ID is required.');
+      // A new sample has a different length, so the previous region and gain do not carry over.
       return {
         ...project,
         channels: project.channels.map((channel) =>
-          channel.id === command.channelId ? { ...channel, sampleId, sampleName } : channel,
+          channel.id === command.channelId ? { ...withoutSampleTrim(channel), sampleId, sampleName } : channel,
         ),
       };
     }
 
     case 'channel.sample.clear': {
       requireChannel(project, command.channelId);
-      if (!project.channels.some((channel) => channel.id === command.channelId && channel.sampleId)) return project;
+      if (!project.channels.some((channel) => channel.id === command.channelId && (channel.sampleId || channel.sampleTrim))) return project;
       return {
         ...project,
         channels: project.channels.map((channel) =>
-          channel.id === command.channelId ? { ...channel, sampleId: undefined, sampleName: undefined } : channel,
+          channel.id === command.channelId ? { ...withoutSampleTrim(channel), sampleId: undefined, sampleName: undefined } : channel,
         ),
+      };
+    }
+
+    case 'channel.sample.trim.set': {
+      const channel = requireChannelRecord(project, command.channelId);
+      if (!channel.sampleId) throw new ProjectCommandError('Load a sample into this channel before setting its region.');
+      const asset = project.audioAssets.find((item) => item.id === channel.sampleId);
+      if (!asset) throw new ProjectCommandError('The channel sample is missing from the project.');
+      const next = command.trim === null ? undefined : { ...command.trim };
+      if (next !== undefined) {
+        try {
+          assertValidSampleTrim(next, asset.durationSeconds, channel.name);
+        } catch (error) {
+          throw new ProjectCommandError(error instanceof Error ? error.message : 'Invalid sample region.');
+        }
+      }
+      if (JSON.stringify(channel.sampleTrim ?? null) === JSON.stringify(next ?? null)) return project;
+      return {
+        ...project,
+        channels: project.channels.map((item) => {
+          if (item.id !== command.channelId) return item;
+          const { sampleTrim: _previous, ...rest } = item;
+          return next === undefined ? rest : { ...rest, sampleTrim: next };
+        }),
+      };
+    }
+
+    case 'channel.synth.set': {
+      const channel = requireChannelRecord(project, command.channelId);
+      if (channel.kind !== 'instrument') throw new ProjectCommandError('Only instrument channels have a synthesizer.');
+      const next = command.synth === null ? undefined : command.synth;
+      if (next !== undefined) validateChannelSynth(next);
+      if (JSON.stringify(channel.synth ?? null) === JSON.stringify(next ?? null)) return project;
+      return {
+        ...project,
+        channels: project.channels.map((item) => {
+          if (item.id !== command.channelId) return item;
+          const { synth: _previous, ...rest } = item;
+          return next === undefined ? rest : { ...rest, synth: { ...next, params: { ...next.params } } };
+        }),
       };
     }
 

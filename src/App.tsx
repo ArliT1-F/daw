@@ -1,20 +1,21 @@
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react';
 import { BrowserAudioEngine, type AudioEngineState } from './audio/AudioEngine';
-import { SampleStore } from './audio/sampleStore';
+import { SampleStore, buildWaveformPeaks, type LoadedSample, type SampleFile } from './audio/sampleStore';
+import { loadSamplePack, parseSamplePackManifest, sha256Hex, type SamplePackManifest } from './audio/samplePack';
 import { ErrorNotice } from './components/ErrorNotice';
 import { createAppError, type AppError, type ErrorSource } from './core/errors';
 import { applyProjectCommand, createProjectHistory, projectHistoryReducer, type ProjectCommand } from './core/commands';
-import { createInitialProject, createStableId } from './core/project/model';
+import { createInitialProject, createStableId, type AudioAsset } from './core/project/model';
 import { buildMixerState, mixerStateSignature } from './core/mixer/mixerModel';
 import { ArrangementEventSource, buildPatternEvents } from './core/events';
 import { arrangementSignature, audioDurationTicks, getPlaybackRegion, getProjectTempoMap, getSongEndTick, patternStepAtSongPosition, songStepForPatternTick } from './core/arrangement/arrangement';
 import { TICKS_PER_STEP, ticksToSteps } from './core/time/ticks';
-import { buildWaveformPeaks } from './audio/sampleStore';
 import {
   createTransportState,
   transportReducer,
 } from './core/transport';
 import { BrowserPanel } from './features/browser/BrowserPanel';
+import type { LibraryNotice } from './features/browser/SampleLibrary';
 import { ChannelRack, type ChannelSampleStatus } from './features/channel-rack/ChannelRack';
 import { MeterViewRegistry } from './features/mixer/meterView';
 import { Mixer } from './features/mixer/Mixer';
@@ -44,6 +45,59 @@ const PANEL_HOTKEYS: Record<string, string> = {
   '4': PANEL_IDS[3],
   '5': PANEL_IDS[4],
 };
+
+/** Public folder of the bundled 808 starter kit (manifest, WAVs, and license). */
+const STARTER_PACK_DIR = 'samples/808/';
+
+/** Middle C: the pitch used when auditioning a synth patch from the inspector. */
+const SYNTH_AUDITION_PITCH = 60;
+
+interface ImportedSample {
+  sample: LoadedSample;
+  /** True when identical bytes were already decoded, so no new buffer was created. */
+  reused: boolean;
+  /** True when a missing project asset was matched by content hash and brought back. */
+  relinked: boolean;
+  /** True when this import added a new library entry. */
+  added: boolean;
+}
+
+function assetFromSample(sample: LoadedSample): AudioAsset {
+  return {
+    id: sample.id,
+    name: sample.name,
+    durationSeconds: sample.durationSeconds,
+    peaks: buildWaveformPeaks(sample.buffer),
+    contentHash: sample.contentHash,
+    format: sample.format,
+    bytes: sample.bytes,
+    sampleRate: sample.sampleRate || undefined,
+    channels: sample.channels || undefined,
+  };
+}
+
+function describeImport(result: ImportedSample): string {
+  const name = result.sample.name;
+  if (result.relinked) return `Relinked "${name}" to its missing library entry.`;
+  if (result.reused) return `"${name}" is already in the library; its decoded audio was reused.`;
+  return `Added "${name}".`;
+}
+
+function hasSubtleCrypto(): boolean {
+  return typeof crypto !== 'undefined' && Boolean(crypto.subtle);
+}
+
+async function fetchText(url: string): Promise<string> {
+  const response = await fetch(url);
+  if (!response.ok) throw new Error(`Could not download ${url} (HTTP ${response.status}).`);
+  return response.text();
+}
+
+async function fetchArrayBuffer(url: string): Promise<ArrayBuffer> {
+  const response = await fetch(url);
+  if (!response.ok) throw new Error(`HTTP ${response.status}`);
+  return response.arrayBuffer();
+}
 
 export function App() {
   const audioEngineRef = useRef<BrowserAudioEngine | null>(null);
@@ -84,6 +138,8 @@ export function App() {
   const [selectedPatternId, setSelectedPatternId] = useState(() => history.project.patterns[0]?.id ?? '');
   const [selectedClipId, setSelectedClipId] = useState<string | undefined>();
   const [sampleStatus, setSampleStatus] = useState<Record<string, ChannelSampleStatus>>({});
+  const [libraryBusy, setLibraryBusy] = useState(false);
+  const [libraryNotice, setLibraryNotice] = useState<LibraryNotice | null>(null);
   const [collapsed, setCollapsed] = useState<CollapsedPanels>({
     channelRack: false,
     pianoRoll: false,
@@ -144,6 +200,11 @@ export function App() {
 
   // Mixer settings are diffed inside the graph, so a fader move touches one AudioParam and never
   // rebuilds the graph, restarts the scheduler, or cuts a sounding voice.
+  // Channel synth and sample settings reach the voice builder through this registry, not arrangement events.
+  useEffect(() => {
+    audioEngine.setChannelVoices(project.channels);
+  }, [audioEngine, project.channels]);
+
   useEffect(() => {
     audioEngine.setMixerState(mixerState);
   }, [audioEngine, mixerState]);
@@ -196,12 +257,7 @@ export function App() {
    */
   function handleCommand(command: ProjectCommand, options?: { coalesceKey?: string }): boolean {
     try {
-      // Preflight outside the reducer so invalid user edits use the same visible error path as audio errors.
-      const current = projectRef.current;
-      const next = applyProjectCommand(current, command);
-      const changed = next !== current;
-      projectRef.current = next;
-      dispatchProject({ type: 'command', command, coalesceKey: options?.coalesceKey });
+      const changed = commitCommand(command, options);
       setAppError(null);
       return changed;
     } catch (error) {
@@ -210,22 +266,47 @@ export function App() {
     }
   }
 
+  /** Preflight and apply an edit; throws on invalid input so callers choose how to report it. */
+  function commitCommand(command: ProjectCommand, options?: { coalesceKey?: string }): boolean {
+    // Preflight outside the reducer so invalid user edits use the same visible error path as audio errors.
+    const current = projectRef.current;
+    const next = applyProjectCommand(current, command);
+    const changed = next !== current;
+    projectRef.current = next;
+    dispatchProject({ type: 'command', command, coalesceKey: options?.coalesceKey });
+    return changed;
+  }
+
   const handleClearMeterClip = useCallback((mixerChannelId: string) => {
     audioEngine.clearMeterClip(mixerChannelId);
   }, [audioEngine]);
+
+  /**
+   * The single import path for every sample source (Channel Rack drop, library, starter pack, and
+   * Playlist audio). Identical bytes reuse the decoded buffer; a missing project asset with the same
+   * hash is relinked instead of duplicated.
+   */
+  async function importAudioFile(file: SampleFile, options: { channelId?: string } = {}): Promise<ImportedSample> {
+    const store = sampleStoreRef.current!;
+    const { sample, reused } = await store.import(file, {
+      assetIdForHash: (hash) => projectRef.current.audioAssets.find((asset) => asset.contentHash === hash)?.id,
+    });
+    const existing = projectRef.current.audioAssets.find((asset) => asset.id === sample.id);
+    const relinked = !reused && Boolean(projectRef.current.audioAssets.find((asset) => asset.contentHash === sample.contentHash));
+    const commands: ProjectCommand[] = [];
+    if (!existing) commands.push({ type: 'audio.asset.add', asset: assetFromSample(sample) });
+    if (options.channelId) commands.push({ type: 'channel.sample.assign', channelId: options.channelId, sampleId: sample.id, sampleName: sample.name });
+    if (commands.length > 0) {
+      commitCommand(commands.length === 1 ? commands[0] : { type: 'project.batch', commands });
+    }
+    return { sample, reused, relinked, added: !existing };
+  }
 
   async function handleLoadSample(channelId: string, file: File): Promise<void> {
     const displayName = file.name || 'sample';
     setSampleStatus((current) => ({ ...current, [channelId]: { status: 'loading', name: displayName } }));
     try {
-      const sample = await sampleStoreRef.current!.add(file);
-      const applied = handleCommand({
-        type: 'project.batch', commands: [
-          { type: 'audio.asset.add', asset: { id: sample.id, name: sample.name, durationSeconds: sample.durationSeconds, peaks: buildWaveformPeaks(sample.buffer) } },
-          { type: 'channel.sample.assign', channelId, sampleId: sample.id, sampleName: sample.name },
-        ],
-      });
-      if (!applied) throw new Error('The channel is no longer part of the project.');
+      const { sample } = await importAudioFile(file, { channelId });
       setSampleStatus((current) => ({ ...current, [channelId]: { status: 'ready', name: sample.name } }));
     } catch (error) {
       setSampleStatus((current) => ({
@@ -235,15 +316,86 @@ export function App() {
     }
   }
 
+  async function handleImportFiles(files: File[]): Promise<void> {
+    setLibraryBusy(true);
+    const messages: string[] = [];
+    const errors: string[] = [];
+    try {
+      for (const file of files) {
+        try {
+          const result = await importAudioFile(file);
+          messages.push(describeImport(result));
+        } catch (error) {
+          errors.push(`${file.name || 'File'}: ${createAppError('application', error).message}`);
+        }
+      }
+    } finally {
+      setLibraryBusy(false);
+    }
+    setLibraryNotice(errors.length > 0
+      ? { tone: 'error', message: [...messages, ...errors].join(' ') }
+      : { tone: 'info', message: messages.join(' ') || 'No files were selected.' });
+  }
+
+  async function handleLoadStarterPack(): Promise<void> {
+    setLibraryBusy(true);
+    try {
+      // The pack is self-contained: its manifest and every file it lists sit in one folder.
+      const baseUrl = `${import.meta.env.BASE_URL}${STARTER_PACK_DIR}`;
+      const manifest: SamplePackManifest = parseSamplePackManifest(await fetchText(`${baseUrl}manifest.json`));
+      const loaded = await loadSamplePack({
+        baseUrl,
+        manifest,
+        fetchBytes: fetchArrayBuffer,
+        importFile: async (file) => (await importAudioFile(file)).sample,
+        // Without SubtleCrypto (insecure origins) the checksum step is skipped, and the pack is still decoded and named.
+        hash: hasSubtleCrypto() ? sha256Hex : null,
+      });
+      setLibraryNotice({ tone: 'info', message: `Starter kit ready: ${loaded.length} CC0 samples in the library (${manifest.license.name}).` });
+    } catch (error) {
+      setLibraryNotice({ tone: 'error', message: `Starter kit not loaded. ${createAppError('application', error).message}` });
+    } finally {
+      setLibraryBusy(false);
+    }
+  }
+
+  async function handlePreviewAsset(assetId: string): Promise<void> {
+    try {
+      await audioEngine.auditionAsset(assetId);
+      setAppError(null);
+    } catch (error) {
+      reportError('audio', error);
+    }
+  }
+
+  function handleAssignAsset(channelId: string, assetId: string): void {
+    const asset = projectRef.current.audioAssets.find((item) => item.id === assetId);
+    if (!asset) {
+      reportError('project', new Error('That sample is not in the library.'));
+      return;
+    }
+    if (!sampleStoreRef.current!.has(assetId)) {
+      reportError('application', new Error(`${asset.name} is missing from this session. Import the same file to relink it.`));
+      return;
+    }
+    handleCommand({ type: 'channel.sample.assign', channelId, sampleId: asset.id, sampleName: asset.name });
+  }
+
+  async function handleAuditionSynth(channelId: string): Promise<void> {
+    try {
+      await audioEngine.auditionNote(channelId, SYNTH_AUDITION_PITCH, 0.8, 0.5);
+      setAppError(null);
+    } catch (error) {
+      reportError('audio', error);
+    }
+  }
+
   async function handleLoadPlaylistAudio(file: File, trackId: string, startTick: number): Promise<string | null> {
     try {
-      const sample = await sampleStoreRef.current!.add(file);
+      const { sample } = await importAudioFile(file);
       const clipId = createStableId('clip');
       const current = projectRef.current;
-      const applied = handleCommand({ type: 'project.batch', commands: [
-        { type: 'audio.asset.add', asset: { id: sample.id, name: sample.name, durationSeconds: sample.durationSeconds, peaks: buildWaveformPeaks(sample.buffer) } },
-        { type: 'playlist.clip.add', clip: { id: clipId, kind: 'audio', trackId, assetId: sample.id, startTick, durationTicks: audioDurationTicks(current, startTick, sample.durationSeconds), sourceOffsetSeconds: 0, gain: 1 } },
-      ] });
+      const applied = handleCommand({ type: 'playlist.clip.add', clip: { id: clipId, kind: 'audio', trackId, assetId: sample.id, startTick, durationTicks: audioDurationTicks(current, startTick, sample.durationSeconds), sourceOffsetSeconds: 0, gain: 1 } });
       return applied ? clipId : null;
     } catch (error) {
       reportError('application', error);
@@ -418,7 +570,24 @@ export function App() {
         transport={transport}
       />
       <div className={`workspace ${collapsed.browser ? 'workspace--browser-collapsed' : ''}`}>
-        <BrowserPanel collapsed={collapsed.browser} onToggle={() => togglePanel('browser')} />
+        <BrowserPanel
+          activeChannel={project.channels.find((channel) => channel.id === activeChannelId) ?? null}
+          busy={libraryBusy}
+          collapsed={collapsed.browser}
+          isAssetLoaded={(assetId) => sampleStoreRef.current!.has(assetId)}
+          notice={libraryNotice}
+          onAssignAsset={handleAssignAsset}
+          onAuditionSynth={(channelId) => void handleAuditionSynth(channelId)}
+          onCommand={handleCommand}
+          onDismissNotice={() => setLibraryNotice(null)}
+          onError={(message) => reportError('application', new Error(message))}
+          onImportFiles={(files) => void handleImportFiles(files)}
+          onLoadStarterPack={() => void handleLoadStarterPack()}
+          onPreviewAsset={(assetId) => void handlePreviewAsset(assetId)}
+          onPreviewChannel={(channelId) => void handlePreviewChannel(channelId)}
+          onToggle={() => togglePanel('browser')}
+          project={project}
+        />
         <main className={studioClasses}>
           <div className="studio-statusbar">
             <div className="session-label">
@@ -442,7 +611,11 @@ export function App() {
             onDismissSampleError={handleDismissSampleError}
             onLoadSample={handleLoadSample}
             onPreviewChannel={handlePreviewChannel}
+            onSelectChannel={setSelectedChannelId}
             onSelectPattern={setSelectedPatternId}
+            selectedChannelId={activeChannelId}
+            isAssetLoaded={(assetId) => sampleStoreRef.current!.has(assetId)}
+            onAssignAsset={handleAssignAsset}
             onToggle={() => togglePanel('channelRack')}
             pattern={pattern}
             playbackActive={patternPlaybackActive}

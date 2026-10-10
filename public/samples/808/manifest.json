@@ -1,0 +1,87 @@
+{
+  "format": "gridline-sample-pack",
+  "version": 1,
+  "id": "gridline-808-starter",
+  "name": "808 Starter Kit",
+  "description": "Seven one-shot drum sounds from the Roland TR-808 sample set, as published by the upstream project.",
+  "license": {
+    "id": "CC0-1.0",
+    "name": "Creative Commons Zero v1.0 Universal (public domain dedication)",
+    "url": "https://creativecommons.org/publicdomain/zero/1.0/",
+    "file": "LICENSE-CC0-1.0.txt",
+    "sha256": "a2010f343487d3f7618affe54f789f5487602331c0a8d03f49e9a7c547cf0499",
+    "attributionRequired": false
+  },
+  "attribution": "Recorded by Michael Fischer (Technopolis), \"Roland TR-808 Rhythm Composer Sound Sample Set 1.0.0\" (1994), distributed via tidalcycles/sounds-tr808-fischer under CC0 1.0. Credit is not required; it is given here as a courtesy. Roland and TR-808 are trademarks of Roland Corporation, which does not endorse this kit.",
+  "source": {
+    "name": "tidalcycles/sounds-tr808-fischer",
+    "url": "https://github.com/tidalcycles/sounds-tr808-fischer",
+    "commit": "85fbecf1bec32553395625ea659e2a56dfd7c0e1",
+    "retrieved": "2026-10-10"
+  },
+  "samples": [
+    {
+      "id": "808-kick-short",
+      "name": "808 Kick (short)",
+      "category": "kick",
+      "file": "kick-short.wav",
+      "bytes": 22096,
+      "sha256": "7bdb70b44c216ffd4b4188d49a868532f462c180fab1f087b0e75b5a9f40fa07",
+      "upstream": "bd8/BD0000.WAV"
+    },
+    {
+      "id": "808-kick-long",
+      "name": "808 Kick (long)",
+      "category": "kick",
+      "file": "kick-long.wav",
+      "bytes": 44146,
+      "sha256": "77b2648133000406d5add8f5890051d2300c7a1b5015d9800ff954b7a77a8cea",
+      "upstream": "bd8/BD0025.WAV"
+    },
+    {
+      "id": "808-snare",
+      "name": "808 Snare",
+      "category": "snare",
+      "file": "snare.wav",
+      "bytes": 22094,
+      "sha256": "06a671f38ccfa6825fb80597e3423c96d873ec8ee8dc96232f8f53d83fd4650f",
+      "upstream": "sd8/SD0000.WAV"
+    },
+    {
+      "id": "808-hat-closed",
+      "name": "808 Closed Hat",
+      "category": "hat",
+      "file": "hat-closed.wav",
+      "bytes": 22094,
+      "sha256": "c9f30ff2b4d73b03f41960e504e03c54e9a59697af666fe4d155bab9cd1ccae6",
+      "upstream": "ch8/CH.WAV"
+    },
+    {
+      "id": "808-hat-open",
+      "name": "808 Open Hat",
+      "category": "hat",
+      "file": "hat-open.wav",
+      "bytes": 22096,
+      "sha256": "d8ca0f2176aae52143c9f239237a680aab997e566196466a3db64199c8fbe9c2",
+      "upstream": "oh8/OH00.WAV"
+    },
+    {
+      "id": "808-clap",
+      "name": "808 Clap",
+      "category": "clap",
+      "file": "clap.wav",
+      "bytes": 176446,
+      "sha256": "376429bb81cb48d1f392a11cd066c32ffb7883d445b2488704ea52e46bb08286",
+      "upstream": "cp8/CP.WAV"
+    },
+    {
+      "id": "808-rim",
+      "name": "808 Rim Shot",
+      "category": "perc",
+      "file": "rim.wav",
+      "bytes": 22096,
+      "sha256": "20d5cd385c0f8c3a24bbfe78c2e2747776841ede6185bc0fe93f97f0b455b89c",
+      "upstream": "rs8/RS.WAV"
+    }
+  ]
+}
