@@ -1,9 +1,63 @@
-import { useEffect, useState, type KeyboardEvent as ReactKeyboardEvent } from 'react';
+import { useEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from 'react';
 import type { AudioEngineState } from '../../audio/AudioEngine';
 import type { ProjectCommand, ProjectHistoryState } from '../../core/commands';
 import type { Project } from '../../core/project/model';
+import { getMasterChannel } from '../../core/mixer/mixerModel';
 import { formatTransportPosition, type TransportState } from '../../core/transport';
 import { Icon } from '../../components/Icon';
+import type { MeterElementKind, MeterViewRegistry } from '../mixer/meterView';
+
+const METER_ELEMENT_KINDS: MeterElementKind[] = ['fill', 'peak', 'clip', 'readout'];
+
+/**
+ * The master bus's output meter, bound straight into the meter registry so it updates without a
+ * React render. The fader itself lives in the Mixer panel's master strip.
+ */
+function MasterOutputMeter({
+  channelId,
+  muted,
+  registry,
+  onClearClip,
+}: {
+  channelId: string;
+  muted: boolean;
+  registry: MeterViewRegistry;
+  onClearClip: (mixerChannelId: string) => void;
+}) {
+  const rootRef = useRef<HTMLDivElement | null>(null);
+  const viewId = `transport-${channelId}`;
+
+  useEffect(() => {
+    const root = rootRef.current;
+    if (!root || !channelId) return undefined;
+    registry.register(viewId, channelId, 'horizontal');
+    for (const kind of METER_ELEMENT_KINDS) {
+      registry.setElement(viewId, kind, root.querySelector<HTMLElement>(`[data-meter="${kind}"]`));
+    }
+    return () => registry.unregister(viewId);
+  }, [channelId, registry, viewId]);
+
+  return (
+    <div aria-label="Master output meter" className={`master-placeholder ${muted ? 'master-placeholder--muted' : ''}`} ref={rootRef} role="group">
+      <span className="master-caption">{muted ? 'MASTER · MUTE' : 'MASTER'}</span>
+      <div aria-hidden="true" className="master-meter">
+        <i className="master-meter-fill" data-meter="fill" />
+        <i className="master-meter-peak" data-meter="peak" />
+      </div>
+      <button
+        aria-label="No clipping"
+        className="master-clip"
+        data-meter="clip"
+        onClick={() => onClearClip(channelId)}
+        title="Master clip indicator · click to reset"
+        type="button"
+      />
+      <span className="master-state" data-meter="readout" title="Measured master output peak">
+        -inf dB
+      </span>
+    </div>
+  );
+}
 
 const TIME_SIGNATURE_OPTIONS = [
   { numerator: 2, denominator: 4 },
@@ -34,6 +88,9 @@ interface TransportBarProps {
   onUndo: () => void;
   onRedo: () => void;
   onEnableAudio: () => void;
+  /** Binds the transport's master output meter; the app polls the engine and writes into it. */
+  meterRegistry: MeterViewRegistry;
+  onClearMeterClip: (mixerChannelId: string) => void;
 }
 
 export function TransportBar({
@@ -54,7 +111,10 @@ export function TransportBar({
   onUndo,
   onRedo,
   onEnableAudio,
+  meterRegistry,
+  onClearMeterClip,
 }: TransportBarProps) {
+  const master = getMasterChannel(project);
   const [tempoDraft, setTempoDraft] = useState(String(project.settings.tempo));
 
   useEffect(() => setTempoDraft(String(project.settings.tempo)), [project.settings.tempo]);
@@ -175,11 +235,12 @@ export function TransportBar({
       </div>
 
       <div className="topbar-tools">
-        <div aria-label="Master level meter unavailable" className="master-placeholder" role="img" title="Master meter is not implemented">
-          <span className="master-caption">MASTER</span>
-          <div aria-hidden="true" className="master-meter"><i /><i /><i /><i /><i /><i /></div>
-          <span className="master-state">METER OFF</span>
-        </div>
+        <MasterOutputMeter
+          channelId={master?.id ?? ''}
+          muted={Boolean(master?.muted)}
+          onClearClip={onClearMeterClip}
+          registry={meterRegistry}
+        />
         <div className="tool-separator" />
         <button
           aria-label={audioLabel}

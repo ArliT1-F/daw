@@ -7,7 +7,34 @@ export {
   type AudioErrorReason,
   type BrowserAudioEngineOptions,
 } from './AudioEngine';
-export { AudioGraph, type AudioGraphOptions } from './AudioGraph';
+export { AudioGraph, type AudioGraphOptions, type MixerGraphStats, type SyncMixerOptions } from './AudioGraph';
+export {
+  MIXER_MUTE_SMOOTH_SECONDS,
+  MIXER_PARAM_SMOOTH_SECONDS,
+  MixerBus,
+  SourceStrip,
+  clampBusGain,
+  createPanStage,
+  type AudioEffectProcessor,
+  type MixerBusOptions,
+  type PanStage,
+} from './mixerNodes';
+export {
+  METER_ATTACK_SECONDS,
+  METER_CLIP_THRESHOLD,
+  METER_FFT_SIZE,
+  METER_FLOOR_DB,
+  METER_MAX_DELTA_SECONDS,
+  METER_PEAK_FALL_DB_PER_SECOND,
+  METER_PEAK_HOLD_SECONDS,
+  METER_RELEASE_SECONDS,
+  MeterBallistics,
+  MeterBank,
+  emptyMeterReading,
+  type MeterReading,
+  type MeterSample,
+  type TimeDomainSource,
+} from './metering';
 export {
   Scheduler,
   DEFAULT_INTERVAL_MS,

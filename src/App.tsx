@@ -5,8 +5,9 @@ import { ErrorNotice } from './components/ErrorNotice';
 import { createAppError, type AppError, type ErrorSource } from './core/errors';
 import { applyProjectCommand, createProjectHistory, projectHistoryReducer, type ProjectCommand } from './core/commands';
 import { createInitialProject, createStableId } from './core/project/model';
+import { buildMixerState, mixerStateSignature } from './core/mixer/mixerModel';
 import { ArrangementEventSource, buildPatternEvents } from './core/events';
-import { audioDurationTicks, getPlaybackRegion, getProjectTempoMap, getSongEndTick, patternStepAtSongPosition, songStepForPatternTick } from './core/arrangement/arrangement';
+import { arrangementSignature, audioDurationTicks, getPlaybackRegion, getProjectTempoMap, getSongEndTick, patternStepAtSongPosition, songStepForPatternTick } from './core/arrangement/arrangement';
 import { TICKS_PER_STEP, ticksToSteps } from './core/time/ticks';
 import { buildWaveformPeaks } from './audio/sampleStore';
 import {
@@ -15,7 +16,9 @@ import {
 } from './core/transport';
 import { BrowserPanel } from './features/browser/BrowserPanel';
 import { ChannelRack, type ChannelSampleStatus } from './features/channel-rack/ChannelRack';
+import { MeterViewRegistry } from './features/mixer/meterView';
 import { Mixer } from './features/mixer/Mixer';
+import { useMixerMeters } from './features/mixer/useMixerMeters';
 import { PianoRoll } from './features/piano-roll/PianoRoll';
 import { Playlist } from './features/playlist/Playlist';
 import { TransportBar } from './features/transport/TransportBar';
@@ -52,6 +55,11 @@ export function App() {
       return audioEngineRef.current.decodeAudioData(data);
     });
   }
+  const meterRegistryRef = useRef<MeterViewRegistry | null>(null);
+  if (!meterRegistryRef.current) {
+    // Meter views bind their DOM nodes here; the poll loop writes levels without a React render.
+    meterRegistryRef.current = new MeterViewRegistry();
+  }
   if (!audioEngineRef.current) {
     audioEngineRef.current = new BrowserAudioEngine({
       tempoBpm: 124,
@@ -61,6 +69,7 @@ export function App() {
     });
   }
   const audioEngine = audioEngineRef.current;
+  const meterRegistry = meterRegistryRef.current;
 
   const [history, dispatchProject] = useReducer(
     projectHistoryReducer,
@@ -96,7 +105,24 @@ export function App() {
   }, [activeChannelId, selectedChannelId]);
 
   const cycleSteps = ticksToSteps(getSongEndTick(project));
-  const eventSource = useMemo(() => new ArrangementEventSource(project), [project]);
+  /**
+   * The arrangement and the mixer are synced to the engine independently. A mixer edit must not
+   * rebuild the event source, because that path releases sounding voices and refills the lookahead;
+   * conversely an arrangement edit must not be blocked by mixer state. Both signatures exclude
+   * everything the other one owns.
+   */
+  const arrangementKey = useMemo(() => arrangementSignature(project), [project]);
+  const mixerKey = useMemo(() => mixerStateSignature(project), [project]);
+  const eventSource = useMemo(() => new ArrangementEventSource(project), [arrangementKey]);
+  const arrangementSettings = useMemo(
+    () => ({
+      tempoMap: getProjectTempoMap(project),
+      timeSignature: project.settings.timeSignature,
+      loop: getPlaybackRegion(project),
+    }),
+    [arrangementKey],
+  );
+  const mixerState = useMemo(() => buildMixerState(project), [mixerKey]);
   const patternPosition = patternStepAtSongPosition(project, pattern.id, transport.positionStep, selectedClipId);
   const patternTransport = { ...transport, positionStep: patternPosition ?? 0 };
   const patternPlaybackActive = audioState.transportStatus === 'playing' && patternPosition !== null;
@@ -113,12 +139,17 @@ export function App() {
 
   // One atomic reconfiguration and one window refill, never an entire-song event expansion.
   useEffect(() => {
-    audioEngine.setArrangement(eventSource, {
-      tempoMap: getProjectTempoMap(project),
-      timeSignature: project.settings.timeSignature,
-      loop: getPlaybackRegion(project),
-    });
-  }, [audioEngine, eventSource, project]);
+    audioEngine.setArrangement(eventSource, arrangementSettings);
+  }, [audioEngine, eventSource, arrangementSettings]);
+
+  // Mixer settings are diffed inside the graph, so a fader move touches one AudioParam and never
+  // rebuilds the graph, restarts the scheduler, or cuts a sounding voice.
+  useEffect(() => {
+    audioEngine.setMixerState(mixerState);
+  }, [audioEngine, mixerState]);
+
+  // Level meters poll at a bounded rate and write straight into the bound DOM nodes.
+  useMixerMeters(audioEngine, meterRegistry, audioState.status === 'ready');
 
   useEffect(() => audioEngine.subscribe((state) => {
     setAudioState(state);
@@ -157,15 +188,20 @@ export function App() {
     setAppError(createAppError(source, error));
   }
 
-  /** Apply an edit; returns true only when the project actually changed. */
-  function handleCommand(command: ProjectCommand): boolean {
+  /**
+   * Apply an edit; returns true only when the project actually changed.
+   *
+   * `coalesceKey` lets a continuous gesture (a fader or pan drag) emit many commands while staying
+   * a single undo entry.
+   */
+  function handleCommand(command: ProjectCommand, options?: { coalesceKey?: string }): boolean {
     try {
       // Preflight outside the reducer so invalid user edits use the same visible error path as audio errors.
       const current = projectRef.current;
       const next = applyProjectCommand(current, command);
       const changed = next !== current;
       projectRef.current = next;
-      dispatchProject({ type: 'command', command });
+      dispatchProject({ type: 'command', command, coalesceKey: options?.coalesceKey });
       setAppError(null);
       return changed;
     } catch (error) {
@@ -173,6 +209,10 @@ export function App() {
       return false;
     }
   }
+
+  const handleClearMeterClip = useCallback((mixerChannelId: string) => {
+    audioEngine.clearMeterClip(mixerChannelId);
+  }, [audioEngine]);
 
   async function handleLoadSample(channelId: string, file: File): Promise<void> {
     const displayName = file.name || 'sample';
@@ -372,6 +412,8 @@ export function App() {
         onTestTone={handleTestTone}
         onToggleLoop={handleToggleLoop}
         onUndo={handleUndo}
+        meterRegistry={meterRegistry}
+        onClearMeterClip={handleClearMeterClip}
         project={project}
         transport={transport}
       />
@@ -452,7 +494,14 @@ export function App() {
               transport={transport}
             />
           </div>
-          <Mixer collapsed={collapsed.mixer} onToggle={() => togglePanel('mixer')} project={project} />
+          <Mixer
+            collapsed={collapsed.mixer}
+            meterRegistry={meterRegistry}
+            onClearClip={handleClearMeterClip}
+            onCommand={handleCommand}
+            onToggle={() => togglePanel('mixer')}
+            project={project}
+          />
           <footer className="studio-footer">
             <span>LOCAL SESSION · DATA REMAINS IN MEMORY</span>
             <span className="shortcut-guide">Space play/pause&nbsp; · &nbsp;Esc stop&nbsp; · &nbsp;Ctrl/Cmd+Z undo&nbsp; · &nbsp;Alt+1–5 focus panels</span>

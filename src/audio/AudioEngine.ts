@@ -4,7 +4,9 @@ import type { TimeSignature } from '../core/project/model';
 import type { TempoMap } from '../core/time/musicalTime';
 import type { MusicalEvent, MusicalEventSink, MusicalEventSource, ScheduledEventTiming } from '../core/events/musicalEvents';
 import { sampleOnsetKey } from '../core/events/musicalEvents';
-import { AudioGraph } from './AudioGraph';
+import { AudioGraph, type MixerGraphStats } from './AudioGraph';
+import type { MixerState } from '../core/mixer/mixerModel';
+import type { MeterReading } from './metering';
 import { Scheduler, type SchedulerDiagnostics, type AudioContinuation } from './scheduler';
 import { VoicePool } from './voices';
 import { createBestAvailableTimer, type RepeatingTimer } from './timer';
@@ -112,6 +114,8 @@ export class BrowserAudioEngine implements AudioEngine, MusicalEventSink {
   private disposed = false;
   private scheduledSampleOnsets: Array<{ key: string; time: number; iteration: number }> = [];
   private scheduledAudio: ScheduledEventTiming[] = [];
+  /** Mixer settings requested before a context exists; applied when the graph is attached. */
+  private mixerState: MixerState | null = null;
   private readonly listeners = new Set<(state: AudioEngineState) => void>();
 
   constructor(options: BrowserAudioEngineOptions = {}) {
@@ -364,12 +368,67 @@ export class BrowserAudioEngine implements AudioEngine, MusicalEventSink {
     });
   }
 
-  setChannelGain(channelId: string, gain: number): void {
-    this.graph?.setChannelGain(channelId, gain);
+  // ------------------------------------------------------------------- mixer
+
+  /**
+   * Apply the project's mixer settings, routing, and source assignments.
+   *
+   * The graph diffs this against what is already built, so an individual fader, pan, mute, solo, or
+   * route change touches one AudioParam or one connection — it never rebuilds the graph, never
+   * restarts the scheduler, and never cuts a sounding voice.
+   */
+  setMixerState(state: MixerState): void {
+    this.mixerState = state;
+    this.syncMixerGraph();
+  }
+
+  getMixerState(): MixerState | null {
+    return this.mixerState;
+  }
+
+  /** Cumulative proof of how much work mixer changes did; null before a context exists. */
+  getMixerStats(): MixerGraphStats | null {
+    return this.graph?.getMixerStats() ?? null;
+  }
+
+  getMixerRoutingWarnings(): string[] {
+    return this.graph?.getRoutingWarnings() ?? [];
+  }
+
+  /**
+   * Read every level meter once. Callers poll this at a bounded rate (the Mixer uses ~20 Hz);
+   * nothing in the engine schedules meter work on its own.
+   */
+  sampleMeters(): void {
+    this.graph?.sampleMeters(this.now());
+  }
+
+  getMeterReading(mixerChannelId: string): MeterReading | null {
+    return this.graph?.getMeterReading(mixerChannelId) ?? null;
+  }
+
+  getMeterChannelIds(): string[] {
+    return this.graph?.getMeterChannelIds() ?? [];
+  }
+
+  /** Clear one meter's latched clip indicator. */
+  clearMeterClip(mixerChannelId: string): void {
+    this.graph?.clearMeterClip(mixerChannelId);
+  }
+
+  /** Linear gain of one routed source strip; the mixer state owns the channel faders. */
+  setChannelGain(sourceId: string, gain: number): void {
+    this.graph?.setChannelGain(sourceId, gain);
   }
 
   setMasterGain(gain: number): void {
     this.graph?.setMasterGain(gain);
+  }
+
+  private syncMixerGraph(): void {
+    if (!this.graph || !this.mixerState) return;
+    // Orphan strips can only be released while no voice is connected to one.
+    this.graph.syncMixer(this.mixerState, { canPruneStrips: (this.pool?.activeCount ?? 0) === 0 });
   }
 
   // ---------------------------------------------------------------- positions
@@ -573,6 +632,8 @@ export class BrowserAudioEngine implements AudioEngine, MusicalEventSink {
       this.resolveSample,
     );
     context.onstatechange = () => this.handleContextStateChange();
+    // Mixer settings requested before the first gesture are applied to the fresh graph.
+    this.syncMixerGraph();
   }
 
   /**

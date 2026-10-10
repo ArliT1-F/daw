@@ -7,7 +7,7 @@ describe('versioned project model', () => {
     const project = createInitialProject();
 
     expect(() => assertValidProject(project)).not.toThrow();
-    expect(project.version).toBe(2);
+    expect(project.version).toBe(3);
     expect(project.channels).toHaveLength(4);
     expect(project.patterns[0].steps['channel-kick']).toHaveLength(16);
     expect((project.playlist[0].kind === 'pattern' && project.playlist[0].patternId)).toBe(project.patterns[0].id);
@@ -19,7 +19,7 @@ describe('versioned project model', () => {
     const decoded = deserializeProject(encoded);
 
     expect(decoded).toEqual(project);
-    expect(encoded).toContain('"version": 2');
+    expect(encoded).toContain('"version": 3');
   });
 
   it('rejects invalid JSON and unsupported project versions', () => {

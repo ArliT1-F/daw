@@ -10,7 +10,7 @@ describe('studio workspace shell', () => {
       expect(markup).toContain(panel);
     }
     expect(markup).toContain('Transport controls');
-    expect(markup).toContain('Master level meter unavailable');
+    expect(markup).toContain('Master output meter');
   });
 
   it('exposes the transport controls backed by the audio engine', () => {

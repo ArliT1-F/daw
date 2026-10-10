@@ -1,11 +1,46 @@
-import { createStableId, type PatternClip, type PlaylistClip, type PlaylistTrack, type Project } from '../project/model';
+import { createStableId, MASTER_MIXER_CHANNEL_ID, type PatternClip, type PlaylistClip, type PlaylistTrack, type Project } from '../project/model';
 import { secondsAtTick, tickAtSeconds, ticksPerBar, ticksToSteps, TICKS_PER_STEP } from '../time/ticks';
 import type { TempoMap } from '../time/musicalTime';
 
 export const TRACK_COLORS = ['#9992e8', '#79c8b8', '#e6a75c', '#e67872', '#7fa8d8', '#b98bd9'];
 
-export function createPlaylistTrack(name: string, index = 0, id = createStableId('track')): PlaylistTrack {
-  return { id, name, color: TRACK_COLORS[index % TRACK_COLORS.length], muted: false, solo: false };
+/**
+ * A new Playlist track. Audio clips on the track are routed to `mixerChannelId`; pass
+ * `defaultMixerDestination(project)` from the UI to give the track a real insert fader.
+ */
+export function createPlaylistTrack(
+  name: string,
+  index = 0,
+  id = createStableId('track'),
+  mixerChannelId = MASTER_MIXER_CHANNEL_ID,
+): PlaylistTrack {
+  return { id, name, color: TRACK_COLORS[index % TRACK_COLORS.length], muted: false, solo: false, mixerChannelId };
+}
+
+/**
+ * Identity of the arrangement-affecting part of a project.
+ *
+ * The engine retires sounding voices and refills its lookahead window whenever the arrangement
+ * changes, so this signature deliberately excludes everything that cannot change a generated
+ * event: display names and colours, mixer fader/pan/mute/solo state, and mixer routing. Moving a
+ * fader must never cut a held note.
+ */
+export function arrangementSignature(project: Project): string {
+  return JSON.stringify([
+    project.settings.tempo,
+    project.settings.timeSignature,
+    project.settings.swing,
+    project.settings.tempoChanges,
+    project.settings.loop,
+    project.channels.map((channel) => [channel.id, channel.kind, channel.muted, channel.solo, channel.sampleId ?? null]),
+    project.patterns.map((pattern) => [pattern.id, pattern.lengthSteps, pattern.steps, pattern.velocities, pattern.notes]),
+    project.tracks.map((track) => [track.id, track.muted, track.solo]),
+    project.audioAssets.map((asset) => [asset.id, asset.durationSeconds]),
+    project.playlist.map((clip) => [
+      clip.id, clip.kind, clip.trackId, clip.startTick, clip.durationTicks,
+      clip.kind === 'pattern' ? [clip.patternId, clip.sourceOffsetTicks] : [clip.assetId, clip.sourceOffsetSeconds, clip.gain],
+    ]),
+  ]);
 }
 
 export function getProjectTempoMap(project: Project): TempoMap {

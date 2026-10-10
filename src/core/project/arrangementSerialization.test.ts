@@ -5,11 +5,14 @@ import { createTestArrangement } from '../arrangement/__fixtures__/testArrangeme
 import { ArrangementEventSource } from '../events';
 import { TICKS_PER_STEP as T } from '../time/ticks';
 
+/** A genuine version 1 document: bar positions, no tracks or assets, and mixer buses that carried
+ *  only an id, a name, and a role. */
 function legacyProject() {
   const project = createInitialProject();
   const { tracks: _tracks, audioAssets: _assets, ...old } = project;
   const { tempoChanges: _changes, loop: _loop, ...settings } = project.settings;
-  return { ...old, version: 1, settings, playlist: [
+  const mixerChannels = project.mixerChannels.map(({ id, name, role }) => ({ id, name, role }));
+  return { ...old, mixerChannels, version: 1, settings, playlist: [
     { id: 'old-a', patternId: 'pattern-main', startBar: 2, lengthBars: 3 },
     { id: 'old-b', patternId: 'pattern-main', startBar: 5, lengthBars: 1 },
   ] };
@@ -32,7 +35,7 @@ describe('arrangement document serialization and migration', () => {
   it('migrates version 1 bar positions to one track and keeps the original shared pattern identities', () => {
     const old = legacyProject();
     const project = deserializeProject(JSON.stringify(old));
-    expect(project.version).toBe(2);
+    expect(project.version).toBe(3);
     expect(project.patterns).toEqual(old.patterns);
     expect(project.tracks).toHaveLength(1);
     expect(project.playlist[0]).toMatchObject({ kind: 'pattern', patternId: 'pattern-main', trackId: project.tracks[0].id, startTick: 32 * T, durationTicks: 48 * T });
@@ -66,7 +69,19 @@ describe('arrangement document serialization and migration', () => {
       expect(() => deserializeProject(JSON.stringify(project))).toThrow();
     }
   });
-  it('requires explicit arrangement fields in version 2, rather than silently creating missing content', () => {
+  it('keeps migrated version 1 mixer buses routed to the master bus and gives the new track a route', () => {
+    const project = deserializeProject(JSON.stringify(legacyProject()));
+    expect(project.mixerChannels[0]).toMatchObject({ id: 'mixer-master', role: 'master', volumeDb: 0, muted: false, solo: false });
+    expect(project.mixerChannels[0].outputId).toBeUndefined();
+    expect(project.mixerChannels.slice(1)).toHaveLength(4);
+    for (const channel of project.mixerChannels.slice(1)) {
+      expect(channel).toMatchObject({ role: 'insert', outputId: 'mixer-master', pan: 0, effects: [] });
+    }
+    expect(project.tracks[0].mixerChannelId).toBe('mixer-master');
+    for (const channel of project.channels) expect(channel.mixerChannelId).toMatch(/^mixer-/);
+  });
+
+  it('requires explicit arrangement fields in the current version, rather than silently creating missing content', () => {
     const project = { ...createTestArrangement(), tracks: undefined };
     expect(() => assertValidProject(project)).toThrow('at least one');
   });
