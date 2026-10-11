@@ -1,5 +1,8 @@
-import type { ScheduledEventTiming } from '../core/events/musicalEvents';
+import type { MusicalEventKind, ScheduledEventTiming } from '../core/events/musicalEvents';
+import { DEFAULT_SYNTH_PARAMS, type SynthParams } from '../core/instruments/synthModel';
+import type { SampleTrim } from '../core/project/model';
 import type { AudioGraph } from './AudioGraph';
+import { buildSynthNote } from './synthVoice';
 
 /**
  * Voices: the only place that creates Web Audio nodes for a musical event.
@@ -12,9 +15,17 @@ import type { AudioGraph } from './AudioGraph';
 export const VOICE_RELEASE_SECONDS = 0.008;
 const SILENCE = 0.0001;
 
+/**
+ * Polyphony limits. A new voice beyond either limit steals the oldest voice in scope, releasing it
+ * with the short cut fade, so a dense pattern or a stuck loop cannot grow the node graph forever.
+ */
+export const MAX_ACTIVE_VOICES = 96;
+export const MAX_VOICES_PER_CHANNEL = 16;
+
 export interface Voice {
   readonly id: string;
   readonly channelId: string;
+  readonly kind: MusicalEventKind;
   readonly startTime: number;
   /** Time at which the voice stops sounding; shortened when cut. */
   endTime: number;
@@ -30,7 +41,23 @@ interface VoiceParts {
   /** Envelope gains that are faded out when the voice is cut. */
   gains: GainNode[];
   endTime: number;
+  /** Buffer playback window, when the voice reads a decoded buffer rather than an oscillator. */
+  start?: { offset: number; duration: number };
 }
+
+/**
+ * Per-channel playback settings resolved at voice-build time. Read live from the engine, so
+ * editing a synth or a sample region changes the next note without touching the arrangement.
+ */
+export interface ChannelVoiceSettings {
+  /** Loaded sample assigned to the channel, if any. */
+  sampleId?: string;
+  sampleTrim?: SampleTrim;
+  /** Synth patch for instrument channels. Absent = the default patch. */
+  synth?: SynthParams;
+}
+
+export type ChannelResolver = (channelId: string) => ChannelVoiceSettings | null;
 
 export type DrumVoiceId = 'kick' | 'snare' | 'hat' | 'perc';
 
@@ -59,6 +86,7 @@ class WebAudioVoice implements Voice {
   constructor(
     readonly id: string,
     readonly channelId: string,
+    readonly kind: MusicalEventKind,
     readonly startTime: number,
     endTime: number,
     private readonly context: AudioContext,
@@ -141,27 +169,40 @@ class WebAudioVoice implements Voice {
   }
 }
 
-/** Build and start a voice for a scheduled event. Returns null for unsupported event kinds. */
+/**
+ * Build and start a voice for a scheduled event. Returns null for unsupported event kinds, for
+ * zero-velocity events, and for an assigned sample that is not loaded (a missing sample is silent
+ * and is never replaced by a synthesized substitute).
+ */
 export function createVoice(
   timing: ScheduledEventTiming,
   graph: AudioGraph,
   onEnded: (voice: Voice) => void,
   resolveSample?: SampleResolver,
+  resolveChannel?: ChannelResolver,
 ): Voice | null {
   const { event, time } = timing;
   if (event.velocity <= 0) return null;
   const destination = graph.getChannelBus(event.channelId);
+  const channel = event.kind === 'sample' || event.kind === 'note' ? resolveChannel?.(event.channelId) ?? null : null;
   const buffer = event.kind === 'sample' ? resolveSample?.(event.sampleId) : event.kind === 'audio' ? resolveSample?.(event.assetId) : null;
-  const parts =
-    event.kind === 'sample'
-      ? buffer
-        ? createSampleParts(graph, buffer, time, event.velocity, destination)
-        : createDrumParts(graph, event.sampleId, time, event.velocity, destination)
-      : event.kind === 'note'
-        ? createSynthParts(graph, event.pitch, time, timing.durationSeconds, event.velocity, destination)
-        : event.kind === 'audio' && buffer
-          ? createAudioClipParts(graph, buffer, time, timing.durationSeconds, timing.sourceOffsetSeconds ?? event.sourceOffsetSeconds, event.velocity, destination)
-          : null;
+  let parts: VoiceParts | null;
+  if (event.kind === 'sample') {
+    if (buffer) {
+      parts = createSampleParts(graph, buffer, time, event.velocity, destination, channel?.sampleTrim);
+    } else if (channel?.sampleId) {
+      // The channel's sample is assigned but its buffer is not loaded: stay silent and let the UI report it.
+      return null;
+    } else {
+      parts = createDrumParts(graph, event.sampleId, time, event.velocity, destination);
+    }
+  } else if (event.kind === 'note') {
+    parts = buildSynthNote(graph.context, channel?.synth ?? DEFAULT_SYNTH_PARAMS, event.pitch, time, timing.durationSeconds, event.velocity, destination);
+  } else if (event.kind === 'audio' && buffer) {
+    parts = createAudioClipParts(graph, buffer, time, timing.durationSeconds, timing.sourceOffsetSeconds ?? event.sourceOffsetSeconds, event.velocity, destination);
+  } else {
+    parts = null;
+  }
 
   if (!parts) return null;
 
@@ -177,6 +218,7 @@ export function createVoice(
   const voice = new WebAudioVoice(
     `${event.id}:${timing.iteration}`,
     event.channelId,
+    event.kind,
     time,
     parts.endTime,
     graph.context,
@@ -189,8 +231,8 @@ export function createVoice(
   const startedSources: AudioScheduledSourceNode[] = [];
   try {
     for (const source of parts.sources) {
-      if (event.kind === 'audio') {
-        (source as AudioBufferSourceNode).start(time, timing.sourceOffsetSeconds ?? event.sourceOffsetSeconds, Math.max(0, parts.endTime - time));
+      if (parts.start) {
+        (source as AudioBufferSourceNode).start(time, parts.start.offset, parts.start.duration);
       } else {
         source.start(time);
       }
@@ -198,7 +240,6 @@ export function createVoice(
     }
     for (const source of parts.sources) source.stop(parts.endTime);
   } catch (error) {
-    // A partial start must not leave a source playing if another node fails to start/schedule.
     for (const source of startedSources) {
       try {
         source.stop(graph.context.currentTime);
@@ -215,27 +256,46 @@ export function createVoice(
 /**
  * Pool of sounding voices. Owned by the engine so a stop, seek, or tempo change can cut
  * everything that is scheduled or sounding.
+ *
+ * Voices leave the pool when their sources end, and also when their end time has passed (a
+ * sweep), so a source that never reports `ended` cannot leak. Limits are enforced by stealing.
  */
 export class VoicePool {
   private readonly voices = new Set<Voice>();
+  /** Voices released by stealing; they keep their own short fade but no longer count. */
+  private stolen = 0;
 
   constructor(
     private readonly graph: AudioGraph,
     private readonly onError?: (error: unknown) => void,
     private readonly resolveSample?: SampleResolver,
+    private readonly resolveChannel?: ChannelResolver,
+    private readonly limits: { maxVoices: number; maxVoicesPerChannel: number } = {
+      maxVoices: MAX_ACTIVE_VOICES,
+      maxVoicesPerChannel: MAX_VOICES_PER_CHANNEL,
+    },
   ) {}
 
   get activeCount(): number {
+    this.sweep();
     return this.voices.size;
+  }
+
+  /** Voices stolen since creation; used by tests and diagnostics. */
+  get stealCount(): number {
+    return this.stolen;
   }
 
   /** Start times of every tracked voice — used by tests and diagnostics. */
   getStartTimes(): number[] {
+    this.sweep();
     return [...this.voices].map((voice) => voice.startTime).sort((a, b) => a - b);
   }
 
   schedule(timing: ScheduledEventTiming): void {
     try {
+      this.sweep();
+      this.makeRoom(timing.event.channelId);
       const voice = createVoice(
         timing,
         this.graph,
@@ -243,6 +303,7 @@ export class VoicePool {
           this.voices.delete(ended);
         },
         this.resolveSample,
+        this.resolveChannel,
       );
       if (voice) this.voices.add(voice);
     } catch (error) {
@@ -255,6 +316,7 @@ export class VoicePool {
     for (const voice of [...this.voices]) {
       if (voice.startTime >= time) voice.cancel();
     }
+    this.sweep();
   }
 
   /** Cut everything sounding at `atTime`. */
@@ -270,6 +332,42 @@ export class VoicePool {
     for (const voice of [...this.voices]) voice.dispose();
     this.voices.clear();
   }
+
+  /** Forget voices whose end time has passed, whether or not their `ended` event arrived. */
+  private sweep(): void {
+    const now = this.graph.context.currentTime;
+    for (const voice of [...this.voices]) {
+      if (voice.endTime <= now) {
+        voice.dispose();
+        this.voices.delete(voice);
+      }
+    }
+  }
+
+  /**
+   * Make room for one more voice on `channelId`: first within the channel's own limit, then
+   * globally. The victim is the oldest voice by start time; ties keep insertion order.
+   */
+  private makeRoom(channelId: string): void {
+    const sameChannel = [...this.voices].filter((voice) => voice.channelId === channelId);
+    if (sameChannel.length >= this.limits.maxVoicesPerChannel) this.steal(oldest(sameChannel));
+    if (this.voices.size >= this.limits.maxVoices) this.steal(oldest([...this.voices]));
+  }
+
+  private steal(victim: Voice | undefined): void {
+    if (!victim) return;
+    victim.cancel();
+    this.voices.delete(victim);
+    this.stolen += 1;
+  }
+}
+
+function oldest(voices: Voice[]): Voice | undefined {
+  let best: Voice | undefined;
+  for (const voice of voices) {
+    if (!best || voice.startTime < best.startTime) best = voice;
+  }
+  return best;
 }
 
 function createDrumParts(
@@ -291,19 +389,27 @@ function createDrumParts(
   }
 }
 
-/** One-shot playback of a decoded sample buffer, shaped by the step velocity. */
+/**
+ * One-shot playback of a decoded sample buffer, shaped by the step velocity, the channel's gain,
+ * and its start/end region. The region is applied as the buffer playback window, so trimming never
+ * copies or re-decodes audio.
+ */
 function createSampleParts(
   graph: AudioGraph,
   buffer: AudioBuffer,
   time: number,
   velocity: number,
   destination: AudioNode,
+  trim?: SampleTrim,
 ): VoiceParts {
   const context = graph.context;
   const source = context.createBufferSource();
   const gain = context.createGain();
-  const peak = Math.max(SILENCE * 2, Math.min(1, velocity));
-  const duration = Math.max(0.02, buffer.duration);
+  const offset = trim ? Math.min(Math.max(0, trim.startSeconds), buffer.duration) : 0;
+  const regionEnd = trim ? Math.min(trim.endSeconds, buffer.duration) : buffer.duration;
+  const duration = Math.max(0.005, regionEnd - offset);
+  const sampleGain = trim ? Math.min(2, Math.max(0, trim.gain)) : 1;
+  const peak = Math.max(SILENCE * 2, Math.min(2, velocity * sampleGain));
   const endTime = time + duration;
   const release = Math.min(0.012, duration / 2);
 
@@ -315,7 +421,7 @@ function createSampleParts(
 
   source.connect(gain);
   gain.connect(destination);
-  return { sources: [source], gains: [gain], endTime };
+  return { sources: [source], gains: [gain], endTime, start: { offset, duration } };
 }
 
 /** Trimmed native-speed asset playback. Unlike a drum trigger, a missing asset is silent. */
@@ -337,7 +443,7 @@ function createAudioClipParts(
   gain.gain.linearRampToValueAtTime(SILENCE, endTime);
   source.connect(gain);
   gain.connect(destination);
-  return { sources: [source], gains: [gain], endTime };
+  return { sources: [source], gains: [gain], endTime, start: { offset: offsetSeconds, duration } };
 }
 
 function createKick(graph: AudioGraph, time: number, velocity: number, destination: AudioNode): VoiceParts {
@@ -433,60 +539,4 @@ function createPerc(graph: AudioGraph, time: number, velocity: number, destinati
   gain.connect(destination);
   const endTime = time + 0.15;
   return { sources: [oscillator], gains: [gain], endTime };
-}
-
-function createSynthParts(
-  graph: AudioGraph,
-  pitch: number,
-  time: number,
-  durationSeconds: number,
-  velocity: number,
-  destination: AudioNode,
-): VoiceParts {
-  const context = graph.context;
-  const frequency = midiToFrequency(pitch);
-  const peak = Math.max(SILENCE * 2, velocity * 0.35);
-  const hold = Math.max(0.0001, durationSeconds);
-  const noteEnd = time + hold;
-  const attack = Math.min(0.01, Math.max(0.0001, hold * 0.2));
-  const release = 0.06;
-  const sustainLevel = Math.max(SILENCE * 2, peak * 0.7);
-
-  const gain = context.createGain();
-  gain.gain.setValueAtTime(SILENCE, time);
-  gain.gain.exponentialRampToValueAtTime(peak, time + attack);
-  gain.gain.exponentialRampToValueAtTime(sustainLevel, time + Math.min(hold, attack + 0.12));
-  gain.gain.setValueAtTime(sustainLevel, noteEnd);
-  gain.gain.exponentialRampToValueAtTime(SILENCE, noteEnd + release);
-
-  const filter = context.createBiquadFilter();
-  filter.type = 'lowpass';
-  filter.Q.value = 0.9;
-  filter.frequency.setValueAtTime(Math.min(6000, frequency * 4 + 400), time);
-  filter.frequency.exponentialRampToValueAtTime(Math.max(400, frequency * 8 + 800), time + attack);
-  filter.frequency.exponentialRampToValueAtTime(Math.max(300, frequency * 2 + 300), noteEnd + release);
-
-  const sawA = context.createOscillator();
-  sawA.type = 'sawtooth';
-  sawA.frequency.value = frequency;
-  sawA.detune.value = -7;
-  const sawB = context.createOscillator();
-  sawB.type = 'sawtooth';
-  sawB.frequency.value = frequency;
-  sawB.detune.value = 7;
-  const sub = context.createOscillator();
-  sub.type = 'sine';
-  sub.frequency.value = frequency / 2;
-  const subGain = context.createGain();
-  subGain.gain.value = 0.5;
-
-  sawA.connect(filter);
-  sawB.connect(filter);
-  sub.connect(subGain);
-  subGain.connect(filter);
-  filter.connect(gain);
-  gain.connect(destination);
-
-  const endTime = noteEnd + release + 0.02;
-  return { sources: [sawA, sawB, sub], gains: [gain], endTime };
 }

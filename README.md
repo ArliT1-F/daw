@@ -135,10 +135,10 @@ Tempo markers are supported. Mixer faders, pan, mute/solo, routing, and metering
 
 The implementation was actually checked with:
 
-- **`npm test`: 36 files, 444 tests passed.** Includes the existing Channel Rack, Piano Roll, Playlist, and engine suites, plus the Phase 6 additions: mixer model maths/routing/cycle detection and signatures, mixer commands and history coalescing, mixer serialization and v2→v3 migration, mixer-graph topology/diff/dispose, meter ballistics and bank, mixer playback routing and lifecycle, the Mixer panel UI, and App mixer wiring.
+- **`npm test`: 43 files, 541 tests passed** (up from 36 files / 444 tests before Phase 7). Phase 7 adds sample import and identity (`sampleStore`, `sampleReuse`, decode errors, relink), sample-pack manifest rejection, checksum and size mismatch, `loadSamplePack` with a fake fetch and import, a check of the shipped kit against its files on disk, voice caps (96 total, 16 per channel, oldest stolen, sweep after end time), pool cleanup, synth note on/off, polyphony, pitch and detune, ADSR breakpoints, synth edits not releasing held notes, preset parse and reject cases, arrangement-signature exclusions, audition through channel region and gain, the library/inspector/synth UI, and an App-level integration test (`src/App.phase7.test.tsx`). Earlier phases: includes the existing Channel Rack, Piano Roll, Playlist, and engine suites, plus the Phase 6 additions: mixer model maths/routing/cycle detection and signatures, mixer commands and history coalescing, mixer serialization and v2→v3 migration, mixer-graph topology/diff/dispose, meter ballistics and bank, mixer playback routing and lifecycle, the Mixer panel UI, and App mixer wiring.
 - **`npm run typecheck`: passed**, including the browser test code/configuration.
 - **`npm run build`: passed**, producing the production bundle.
-- **`npm run test:browser`: 9 Chromium specs** (5 Playlist + 4 Mixer). The mixer specs measure the real master-output signal and assert the master fader gates it, insert mute/solo gate it before the master bus, rerouting keeps it audible, and the meters go live while playing. Requires `npx playwright install chromium`.
+- **`npm run test:browser`: 9 Chromium specs** (5 Playlist + 4 Mixer), **not run in the Phase 7 sandbox**: Playwright could not download Chromium there (`Failed to download Chrome for Testing`). No new browser specs were added for Phase 7; the same flows are covered by the jsdom integration test above. The browser specs still need a run on a machine with Chromium. The mixer specs measure the real master-output signal and assert the master fader gates it, insert mute/solo gate it before the master bus, rerouting keeps it audible, and the meters go live while playing. Requires `npx playwright install chromium`.
 - Browser audio checks use the real Web Audio graph and measure a nonzero master-output signal during playback and silence after stop. Fixture assertions check distinct instruments/instances, tempo-aware onsets, audio offsets/durations, and no repeated `(event ID, iteration)` pairs. **This is automated signal verification, not a human listening test.**
 
 The shared fixture in `src/core/arrangement/__fixtures__/testArrangement.ts` combines phase-shifted shared patterns, two pitched instruments, one audio asset, a step 24–56 loop, and 120→90→150 BPM markers. Additional engine regressions cover editing during startup headroom, exact lookahead edges, zero-velocity/retimed-onset suppression, separator-safe event identities, live native-audio phase continuity, exclusive-loop-end seeks, loop edits that implicitly seek, one-tick loops at 300 BPM, missing assets, stopping, and stalls.
@@ -187,8 +187,48 @@ voices → source strip → mixer bus (effect slots → fader → pan → meter)
 
 Mixer channels (name, role, fader, pan, mute/solo, destination, and prepared effect slots) and track/channel assignments are part of the versioned project document (**v3**, migrated from v2/v1). Every mixer edit is an undoable command and round-trips through JSON.
 
+## Samples, synth, and starter kit — Phase 7
+
+### Sample library
+
+- **Import** WAV and any other format the browser can decode (MP3, OGG/Opus, FLAC, M4A/AAC, WebM audio, AIFF). Files are checked by extension and MIME type first; unsupported files, empty files, files over 64 MB, and decode failures get a specific message and leave the project unchanged.
+- **Drag and drop** onto the library or onto a Channel Rack row. Dragging a library row onto a rack row assigns it.
+- Each library entry shows duration, sample rate, channels, size, and format. Assign a sample to the selected channel, audition it, or clear it.
+- **Identity and reuse.** A content hash (`sha256:<hex>` when SubtleCrypto is available, otherwise `fnv1a32:<hex>`) identifies the bytes. Importing identical bytes again, under any name, reuses the already-decoded buffer and creates no second asset. The buffer is decoded once.
+- **Missing files.** Project assets are saved without audio. After a reload they show as *missing*: the rack chip is flagged, previews refuse to play a stand-in, and importing the same file relinks the existing asset (same ID, region and gain kept).
+- **Region and gain.** Each channel can set a start and end (seconds, clamped to the file) and a gain from 0 to 200%. The region is applied as the buffer playback window, so trimming never copies or re-decodes audio. Assigning a new sample resets the region.
+
+### Starter kit (CC0)
+
+The **Add 808 starter kit** button loads seven one-shot drum sounds from `public/samples/808/`: kick (short and long), snare, closed and open hat, clap, and rim. The pack is self-contained: `manifest.json` lists every file with its byte length and SHA-256, and the loader verifies each one before decoding. A mismatch stops the load and names the file.
+
+- **License:** CC0 1.0 Universal (public domain dedication). The full text is in `public/samples/808/LICENSE-CC0-1.0.txt`. Attribution is not legally required; it is given as a courtesy to Michael Fischer / Technopolis, in `public/samples/808/LICENSES.md`.
+- **Source:** [tidalcycles/sounds-tr808-fischer](https://github.com/tidalcycles/sounds-tr808-fischer) at commit `85fbecf1bec32553395625ea659e2a56dfd7c0e1`. Each file is an unmodified copy of the upstream file at that commit, and its checksum was computed from the upstream file.
+- Roland and TR-808 are trademarks of Roland Corporation, which does not endorse this kit.
+
+### Built-in synthesizer
+
+- One instrument model for every instrument channel. Native Web Audio only: two detuned oscillators (or one, with spread at 0), a lowpass `BiquadFilter`, and a linear ADSR gain envelope.
+- Controls: waveform (sine, square, sawtooth, triangle), octave, semitone, fine tune in cents, tuning (A4 = 400–480 Hz), detune spread, ADSR, filter cutoff (logarithmic slider, 40 Hz–20 kHz) and resonance, and level. Every value is validated against the same bounds the UI, the commands, and the preset parser use.
+- **Note-off** holds the note for its musical duration, then releases it over the release time. A release during attack or decay ramps from the level reached at that moment, so it never jumps.
+- **Polyphony** is one voice per note, with the caps described below.
+- Changing a synth parameter applies to the next note. It never releases a note that is already held, and never rebuilds the arrangement (`arrangementSignature` excludes synth and trim).
+- **Presets:** Detuned Saw, Sub Bass, Saw Pluck, Square Lead, Soft Pad, and Sine Bell. A preset is a plain parameter set, not an audio graph. Export and import use the versioned file `{ "format": "gridline-synth-preset", "version": 1, "name", "params" }`. Unknown formats, unknown versions, unknown parameters, out-of-range values, and bad names are rejected with a message.
+
+### Performance limits
+
+- At most **96 voices** in total and **16 per channel**. When a limit is reached, the oldest voice by start time is stolen. An unstarted voice is cancelled; a sounding one gets the short cut fade.
+- Voices are removed when their sources end and swept once their end time has passed, even if the `ended` event never fires. `clear()` disposes every voice.
+- Sample voices share one decoded `AudioBuffer`, so many simultaneous hits do not copy audio.
+
+### Channel Rack and inspector
+
+- Click a channel to select it. The Piano Roll and the Browser inspector follow the selection.
+- **Add synth** creates an instrument channel with the default patch. The Browser inspector shows the sample region and gain, and the synth editor for instrument channels.
+- A channel with a missing sample is silent rather than playing a drum stand-in, and the chip says so.
+
 ## Current limits
 
 Loaded audio is **session-only**. JSON keeps asset IDs, names, duration, and waveform metadata, but not decoded buffers or original file bytes. There is no persistent audio relink workflow yet. Refreshing the app also resets the in-memory project; save/load UI and IndexedDB persistence remain deferred.
 
-The drum kit and pitched synth are synthesized placeholders, with no bundled audio library. There is no time stretching, audio consolidation/export, plugin hosting, or effect automation. The mixer's effect slots are wired as unity bypasses: they validate, persist, and reserve a stable chain position, but no processor runs yet. Deferred features are labeled in the UI. No external fonts, bundled media downloads, or network services are needed for the app itself.
+Drum channels fall back to synthesized drum voices when no sample is assigned. The bundled audio is the CC0 808 starter kit only; there is no larger library and no sample-pack download service. The synth is a single lightweight model, not a plugin or sampler: no LFO, no per-note pitch envelope, and no multi-sample mapping. There is no time stretching, audio consolidation/export, plugin hosting, or effect automation. The mixer's effect slots are wired as unity bypasses: they validate, persist, and reserve a stable chain position, but no processor runs yet. Deferred features are labeled in the UI. No external fonts, bundled media downloads, or network services are needed for the app itself.

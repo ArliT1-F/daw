@@ -1,18 +1,46 @@
+import type { ProjectCommand } from '../../core/commands';
+import type { Channel, Project } from '../../core/project/model';
 import { PanelFrame } from '../../components/PanelFrame';
+import { ChannelInspector } from './ChannelInspector';
+import { SampleLibrary, type LibraryNotice } from './SampleLibrary';
 
 interface BrowserPanelProps {
   collapsed: boolean;
   onToggle: () => void;
+  project: Project;
+  activeChannel: Channel | null;
+  isAssetLoaded: (assetId: string) => boolean;
+  busy: boolean;
+  notice: LibraryNotice | null;
+  onDismissNotice: () => void;
+  onCommand: (command: ProjectCommand, options?: { coalesceKey?: string }) => boolean;
+  onImportFiles: (files: File[]) => void;
+  onLoadStarterPack: () => void;
+  onPreviewAsset: (assetId: string) => void;
+  onAssignAsset: (channelId: string, assetId: string) => void;
+  onPreviewChannel: (channelId: string) => void;
+  onAuditionSynth: (channelId: string) => void;
+  onError: (message: string) => void;
 }
 
-const LIBRARY_SECTIONS = [
-  { name: 'Instruments', description: 'Synths & samplers' },
-  { name: 'Samples', description: 'One-shots & loops' },
-  { name: 'Presets', description: 'Sound libraries' },
-  { name: 'Projects', description: 'Local project files' },
-];
-
-export function BrowserPanel({ collapsed, onToggle }: BrowserPanelProps) {
+export function BrowserPanel({
+  collapsed,
+  onToggle,
+  project,
+  activeChannel,
+  isAssetLoaded,
+  busy,
+  notice,
+  onDismissNotice,
+  onCommand,
+  onImportFiles,
+  onLoadStarterPack,
+  onPreviewAsset,
+  onAssignAsset,
+  onPreviewChannel,
+  onAuditionSynth,
+  onError,
+}: BrowserPanelProps) {
   return (
     <aside className={`browser-aside ${collapsed ? 'browser-aside--collapsed' : ''}`}>
       <PanelFrame
@@ -24,28 +52,27 @@ export function BrowserPanel({ collapsed, onToggle }: BrowserPanelProps) {
         title="Browser"
       >
         <div className="browser-content">
-          <div className="browser-intro">
-            <span className="eyebrow">LOCAL LIBRARY</span>
-            <p>Browse the building blocks for your next idea.</p>
-          </div>
-          <div className="browser-sections">
-            {LIBRARY_SECTIONS.map((section, index) => (
-              <div aria-disabled="true" className="browser-entry" key={section.name}>
-                <span className={`browser-entry-icon browser-entry-icon--${index}`} aria-hidden="true">{['◈', '▤', '✳', '▣'][index]}</span>
-                <span className="browser-entry-copy">
-                  <span className="browser-entry-name">{section.name}</span>
-                  <span className="browser-entry-description">{section.description}</span>
-                </span>
-                <span className="browser-entry-lock">LATER</span>
-              </div>
-            ))}
-          </div>
-          <div className="browser-empty-state">
-            <div className="browser-empty-symbol" aria-hidden="true">⌁</div>
-            <strong>Asset browser is not implemented</strong>
-            <p>Instrument, sample, and preset loading will be added after the audio engine foundation.</p>
-          </div>
-          <div className="browser-local-note"><span className="status-light status-light--idle" /> No network library or cloud assets</div>
+          <SampleLibrary
+            activeChannel={activeChannel}
+            assets={project.audioAssets}
+            busy={busy}
+            isLoaded={isAssetLoaded}
+            notice={notice}
+            onAssignAsset={onAssignAsset}
+            onDismissNotice={onDismissNotice}
+            onImportFiles={onImportFiles}
+            onLoadStarterPack={onLoadStarterPack}
+            onPreviewAsset={onPreviewAsset}
+          />
+          <ChannelInspector
+            assets={project.audioAssets}
+            channel={activeChannel}
+            isAssetLoaded={isAssetLoaded}
+            onAuditionSynth={onAuditionSynth}
+            onCommand={onCommand}
+            onError={onError}
+            onPreviewChannel={onPreviewChannel}
+          />
         </div>
       </PanelFrame>
     </aside>

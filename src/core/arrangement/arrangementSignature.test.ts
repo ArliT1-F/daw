@@ -2,6 +2,9 @@ import { describe, expect, it } from 'vitest';
 import { applyProjectCommand, type ProjectCommand } from '../commands';
 import { createInitialProject, type Project } from '../project/model';
 import { arrangementSignature } from './arrangement';
+import { DEFAULT_SYNTH_PARAMS } from '../instruments/synthModel';
+
+const DEFAULT_SYNTH_PARAMS_FOR_TEST = DEFAULT_SYNTH_PARAMS;
 
 /**
  * The engine releases sounding voices and refills its lookahead whenever the arrangement signature
@@ -62,3 +65,35 @@ describe('arrangement signature', () => {
     }
   });
 });
+
+describe('arrangement signature and Phase 7 edits', () => {
+  it('ignores synth parameter edits, so tweaking a patch never rebuilds the arrangement', () => {
+    const project = starter();
+    const before = arrangementSignature(project);
+    const tweaked = edit(project, {
+      type: 'channel.synth.set',
+      channelId: 'channel-bass',
+      synth: { version: 1, presetName: null, params: { ...DEFAULT_SYNTH_PARAMS_FOR_TEST, filterCutoffHz: 800, waveform: 'square' } },
+    });
+    expect(arrangementSignature(tweaked)).toBe(before);
+  });
+
+  it('ignores sample region and gain edits, which are read when a voice is built', () => {
+    const project = edit(starter(), { type: 'audio.asset.add', asset: { id: 'asset-kick', name: 'Kick', durationSeconds: 1 } });
+    const assigned = edit(project, { type: 'channel.sample.assign', channelId: 'channel-kick', sampleId: 'asset-kick', sampleName: 'Kick' });
+    const before = arrangementSignature(assigned);
+    const trimmed = edit(assigned, {
+      type: 'channel.sample.trim.set',
+      channelId: 'channel-kick',
+      trim: { startSeconds: 0.1, endSeconds: 0.5, gain: 1.5 },
+    });
+    expect(arrangementSignature(trimmed)).toBe(before);
+  });
+
+  it('still changes when a sample is assigned, because the channel now references a different asset', () => {
+    const project = edit(starter(), { type: 'audio.asset.add', asset: { id: 'asset-kick', name: 'Kick', durationSeconds: 1 } });
+    const assigned = edit(project, { type: 'channel.sample.assign', channelId: 'channel-kick', sampleId: 'asset-kick', sampleName: 'Kick' });
+    expect(arrangementSignature(assigned)).not.toBe(arrangementSignature(project));
+  });
+});
+

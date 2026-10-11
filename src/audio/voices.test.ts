@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { AudioGraph } from './AudioGraph';
+import { DEFAULT_SYNTH_PARAMS } from '../core/instruments/synthModel';
 import { FakeAudioBuffer, createFakeAudioContext } from './__fixtures__/fakeAudioContext';
 import { VOICE_RELEASE_SECONDS, VoicePool, createVoice, midiToFrequency, resolveDrumVoice, type SampleResolver } from './voices';
 import type { ScheduledEventTiming } from '../core/events/musicalEvents';
@@ -62,23 +63,28 @@ describe('voice creation', () => {
     expect(voice?.endTime).toBeCloseTo(1.34, 6);
   });
 
-  it('builds a sustained synth voice with a filter and three oscillators', () => {
+  it('builds a sustained synth voice with two detuned oscillators and a filter', () => {
     const { fake, graph } = createPool();
     const voice = createVoice(timing(note, 2, 0.5), graph, () => {});
-    expect(fake.oscillators).toHaveLength(3);
+    expect(fake.oscillators).toHaveLength(2);
+    expect(fake.oscillators.map((node) => node.detune.value)).toEqual([-7, 7]);
     expect(fake.filters).toHaveLength(1);
-    // 0.5 s of hold plus a 60 ms release plus a small tail.
-    expect(voice?.endTime).toBeCloseTo(2 + 0.5 + 0.06 + 0.02, 6);
+    // 0.5 s of hold plus the default 0.3 s release plus a small guard.
+    expect(voice?.endTime).toBeCloseTo(2 + 0.5 + 0.3 + 0.02, 6);
   });
 
   it('gives very short notes a usable envelope instead of an inverted one', () => {
     const { fake, graph } = createPool();
     const voice = createVoice(timing(note, 0, 0.001), graph, () => {});
-    expect(voice?.endTime).toBeCloseTo(0.001 + 0.06 + 0.02, 9);
+    expect(voice?.endTime).toBeCloseTo(0.001 + 0.3 + 0.02, 9);
     const envelope = fake.gains.find((node) => node.gain.calls.length > 0);
     expect(envelope).toBeDefined();
-    // The attack is shortened for a tiny note instead of running past its release.
-    expect(envelope?.gain.calls[0].time).toBeLessThanOrEqual(0.001);
+    // Released 1 ms into a 10 ms attack: the level at note-off is a tenth of the attack peak.
+    const peak = 0.8 * DEFAULT_SYNTH_PARAMS.level * 0.6 * 0.7;
+    const noteOff = envelope!.gain.calls.find((call) => call.method === 'linearRampToValueAtTime' && Math.abs(call.time - 0.001) < 1e-9);
+    expect(noteOff?.value).toBeCloseTo(peak * 0.1, 9);
+    // Nothing is scheduled past the attack-level note-off except the release back to silence.
+    expect(envelope!.gain.calls.at(-1)).toMatchObject({ method: 'linearRampToValueAtTime', value: 0 });
   });
 
   it('zero-velocity samples and notes create no audible or near-silent fallback voice', () => {

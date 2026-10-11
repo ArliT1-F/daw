@@ -217,12 +217,12 @@ describe('audio engine playback', () => {
     const harness = createEngine({ events: [noteEvent(0, 8)] });
     await harness.engine.play();
     harness.advanceTo(0.1);
-    // Two detuned saws plus a sub oscillator.
-    expect(harness.fake.oscillators).toHaveLength(3);
+    // The default patch is two detuned oscillators through one low-pass filter.
+    expect(harness.fake.oscillators).toHaveLength(2);
     expect(harness.fake.filters).toHaveLength(1);
     const noteEnd = harness.fake.oscillators[0].stopAt ?? 0;
-    // 8 steps at 0.125 s plus a 60 ms release.
-    expect(noteEnd).toBeCloseTo(0.06 + 1 + 0.06 + 0.02, 6);
+    // 8 steps at 0.125 s, then the default 0.3 s release and the guard.
+    expect(noteEnd).toBeCloseTo(0.06 + 1 + 0.3 + 0.02, 6);
   });
 
   it('keeps events synchronized across repeated loops', async () => {
@@ -391,12 +391,58 @@ describe('audio engine playback', () => {
     expect(harness.fake.bufferSources).toHaveLength(0);
   });
 
+  it('auditions a sample through its channel region and gain', async () => {
+    const buffer = new FakeAudioBuffer(1, 48000, 48000); // 1 s
+    const harness = createEngine({ resolveSample: () => buffer as unknown as AudioBuffer });
+    harness.engine.setChannelVoices([
+      {
+        id: 'channel-kick',
+        name: 'Kick',
+        kind: 'drum',
+        color: '#fff',
+        mixerChannelId: 'mixer-insert-1',
+        muted: false,
+        solo: false,
+        sampleId: 'sample-1',
+        sampleTrim: { startSeconds: 0.25, endSeconds: 0.5, gain: 0.5 },
+      },
+    ]);
+    await harness.engine.auditionSample('channel-kick', 'sample-1');
+    const source = harness.fake.bufferSources[0];
+    // The region is applied as the playback window: start 0.25 s, length 0.25 s, no copied audio.
+    expect(source.offsetSeconds).toBeCloseTo(0.25, 9);
+    expect(source.durationSeconds).toBeCloseTo(0.25, 9);
+    expect(source.buffer).toBe(buffer);
+  });
+
+  it('refuses to audition a missing asset instead of playing a stand-in', async () => {
+    const harness = createEngine({ resolveSample: () => null });
+    await expect(harness.engine.auditionAsset('asset-gone')).rejects.toThrow(/missing from the session/);
+    expect(harness.fake.bufferSources).toHaveLength(0);
+    expect(harness.fake.oscillators).toHaveLength(0);
+  });
+
+  it('previews a synth edit on the next note, using the registered patch', async () => {
+    const harness = createEngine();
+    const base = {
+      kind: 'instrument' as const,
+      color: '#fff',
+      mixerChannelId: 'mixer-insert-4',
+      muted: false,
+      solo: false,
+    };
+    harness.engine.setChannelVoices([{ ...base, id: 'channel-bass', name: 'Bass', synth: { version: 1, presetName: null, params: { waveform: 'square', octave: 0, semitone: 0, fineCents: 0, tuningHz: 440, spreadCents: 0, attack: 0.01, decay: 0.2, sustain: 0.7, release: 0.3, filterCutoffHz: 3200, filterQ: 0.9, level: 0.8 } } }]);
+    await harness.engine.auditionNote('channel-bass', 60, 0.7);
+    expect(harness.fake.oscillators[0].type).toBe('square');
+    expect(harness.fake.oscillators).toHaveLength(1);
+  });
+
   it('previews a pitched instrument note without starting the transport', async () => {
     const harness = createEngine();
     await harness.engine.auditionNote('channel-bass', 64, 0.7);
     expect(harness.engine.transport.status).toBe('stopped');
-    // Two detuned saws plus a sub oscillator.
-    expect(harness.fake.oscillators).toHaveLength(3);
+    // The default patch is two detuned oscillators.
+    expect(harness.fake.oscillators).toHaveLength(2);
     expect(harness.fake.oscillators[0].startedAt).toBeCloseTo(0.02, 6);
   });
 
@@ -484,7 +530,7 @@ describe('starter project end to end', () => {
     // The snare at step 4 starts together with its hat.
     expect(noiseStarts[3]).toBeCloseTo(noiseStarts[2], 9);
     // kick (1) + bass note on step 0 (3) + snare body (1) + bass note on step 4 (3)
-    expect(fake.oscillators).toHaveLength(8);
+    expect(fake.oscillators).toHaveLength(6); // note voices use two oscillators each, not three
     expect(engine.getDiagnostics().droppedCount).toBe(0);
 
     // Every gap is an exact multiple of one step at the project tempo.
