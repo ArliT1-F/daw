@@ -58,7 +58,7 @@ export interface MixerChannelState {
   solo: boolean;
   /** `null` for the master bus, which always feeds the limiter and the hardware output. */
   outputId: string | null;
-  /** Prepared effect slots, in signal order. Empty slots are unity bypasses. */
+  /** Ordered effect chain, in signal order. Placeholder slots (`type: null`) are unity bypasses. */
   effects: readonly MixerEffectSlot[];
 }
 
@@ -372,7 +372,8 @@ export function mixerStateSignature(project: Project): string {
       channel.muted,
       channel.solo,
       channel.outputId ?? null,
-      channel.effects.map((slot) => [slot.id, slot.type, slot.enabled]),
+      // Parameters are part of the audio identity: turning a knob must reach the graph.
+      channel.effects.map((slot) => [slot.id, slot.type, slot.enabled, Object.entries(slot.params).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))]),
     ]),
     project.channels.map((channel) => [channel.id, channel.mixerChannelId]),
     project.tracks.map((track) => [track.id, track.mixerChannelId]),

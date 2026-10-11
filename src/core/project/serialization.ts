@@ -7,6 +7,7 @@ import {
   type Project,
 } from './model';
 import { ticksPerBar } from '../time/ticks';
+import { fillEffectParams, isEffectType } from '../effects/effectDefinitions';
 
 export function serializeProject(project: Project): string {
   assertValidProject(project);
@@ -103,6 +104,25 @@ function migrateVersionTwo(value: unknown): unknown {
   };
 }
 
+/**
+ * Complete partial effect records by filling each missing parameter with its default.
+ *
+ * This is a load-time normalisation, not a migration: the document version is unchanged, and an
+ * unknown key or an out-of-range value is still rejected by `assertValidProject`.
+ */
+function fillMixerEffectDefaults(value: unknown): unknown {
+  if (!isRecord(value) || value.format !== 'gridline-project' || !Array.isArray(value.mixerChannels)) return value;
+  const mixerChannels = value.mixerChannels.map((channel: unknown) => {
+    if (!isRecord(channel) || !Array.isArray(channel.effects)) return channel;
+    const effects = channel.effects.map((slot: unknown) => {
+      if (!isRecord(slot) || !isEffectType(slot.type) || !isRecord(slot.params)) return slot;
+      return { ...slot, params: fillEffectParams(slot.type, slot.params) };
+    });
+    return { ...channel, effects };
+  });
+  return { ...value, mixerChannels };
+}
+
 export function deserializeProject(serialized: string): Project {
   let parsed: unknown;
   try {
@@ -110,7 +130,7 @@ export function deserializeProject(serialized: string): Project {
   } catch (error) {
     throw new Error('Project data is not valid JSON.', { cause: error });
   }
-  const migrated = migrateVersionTwo(migrateVersionOne(parsed));
+  const migrated = fillMixerEffectDefaults(migrateVersionTwo(migrateVersionOne(parsed)));
   assertValidProject(migrated);
   return migrated;
 }

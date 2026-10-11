@@ -7,6 +7,7 @@ import {
   type ProjectCommand,
 } from './commands';
 import { createAddMixerChannelCommand, mixerEffectSlotId } from './mixerCommands';
+import { defaultEffectParams } from '../effects/effectDefinitions';
 import {
   assertValidProject,
   createInitialProject,
@@ -249,7 +250,7 @@ describe('track and channel mixer assignments', () => {
 describe('prepared effect slots', () => {
   it('places, replaces, and clears slots without touching mix state', () => {
     const project = starter();
-    const slot = { id: 'fx-1', type: 'lowpass', enabled: true, params: { cutoff: 0.6 } };
+    const slot = { id: 'fx-1', type: 'eq3' as const, enabled: true, params: defaultEffectParams('eq3') };
     const filled = apply(project, { type: 'mixer.channel.effect.set', channelId: 'mixer-insert-1', slot: 0, effect: slot });
 
     expect(mixerChannel(filled, 'mixer-insert-1').effects).toEqual([slot]);
@@ -261,7 +262,7 @@ describe('prepared effect slots', () => {
     expect(padded.mixerChannels[1].effects).toHaveLength(3);
     expect(padded.mixerChannels[1].effects[1]).toEqual({ id: mixerEffectSlotId('mixer-insert-1', 1), type: null, enabled: false, params: {} });
 
-    const replaced = apply(padded, { type: 'mixer.channel.effect.set', channelId: 'mixer-insert-1', slot: 0, effect: { ...slot, type: 'delay' } });
+    const replaced = apply(padded, { type: 'mixer.channel.effect.set', channelId: 'mixer-insert-1', slot: 0, effect: { ...slot, type: 'delay' as const, params: defaultEffectParams('delay') } });
     expect(replaced.mixerChannels[1].effects[0].type).toBe('delay');
 
     // Clearing a slot *before* a filled one keeps it as an explicit empty bypass, so slot
@@ -269,18 +270,18 @@ describe('prepared effect slots', () => {
     const gapKept = apply(replaced, { type: 'mixer.channel.effect.set', channelId: 'mixer-insert-1', slot: 1, effect: null });
     expect(gapKept.mixerChannels[1].effects).toHaveLength(3);
     expect(gapKept.mixerChannels[1].effects[1]).toMatchObject({ type: null, enabled: false });
-    expect(gapKept.mixerChannels[1].effects[2].type).toBe('lowpass');
+    expect(gapKept.mixerChannels[1].effects[2].type).toBe('eq3');
 
     // Clearing the trailing slots trims them away, so an emptied channel stores no effect data.
     const cleared = apply(replaced, { type: 'mixer.channel.effect.set', channelId: 'mixer-insert-1', slot: 2, effect: null });
-    expect(cleared.mixerChannels[1].effects).toEqual([{ id: 'fx-1', type: 'delay', enabled: true, params: { cutoff: 0.6 } }]);
+    expect(cleared.mixerChannels[1].effects).toEqual([{ id: 'fx-1', type: 'delay' as const, enabled: true, params: defaultEffectParams('delay') }]);
     const clearedFirst = apply(cleared, { type: 'mixer.channel.effect.set', channelId: 'mixer-insert-1', slot: 0, effect: null });
     expect(clearedFirst.mixerChannels[1].effects).toEqual([]);
   });
 
   it('rejects an out-of-range slot, a duplicate id, and a malformed effect', () => {
     const project = starter();
-    const slot = { id: 'fx-1', type: 'lowpass', enabled: true, params: { cutoff: 0.6 } };
+    const slot = { id: 'fx-1', type: 'eq3' as const, enabled: true, params: defaultEffectParams('eq3') };
     expect(() => apply(project, { type: 'mixer.channel.effect.set', channelId: 'mixer-insert-1', slot: MIXER_EFFECT_SLOT_COUNT, effect: slot })).toThrow('effect slot must be');
     expect(() => apply(project, { type: 'mixer.channel.effect.set', channelId: 'mixer-insert-1', slot: -1, effect: slot })).toThrow('effect slot must be');
     expect(() => apply(project, { type: 'mixer.channel.effect.set', channelId: 'mixer-insert-1', slot: 0.5, effect: slot })).toThrow('effect slot must be');
@@ -288,7 +289,7 @@ describe('prepared effect slots', () => {
     const filled = apply(project, { type: 'mixer.channel.effect.set', channelId: 'mixer-insert-1', slot: 0, effect: slot });
     expect(() => apply(filled, { type: 'mixer.channel.effect.set', channelId: 'mixer-insert-1', slot: 1, effect: slot })).toThrow('unique within a channel');
     expect(() => apply(project, { type: 'mixer.channel.effect.set', channelId: 'mixer-insert-1', slot: 0, effect: { ...slot, id: '  ' } })).toThrow('needs an ID');
-    expect(() => apply(project, { type: 'mixer.channel.effect.set', channelId: 'mixer-insert-1', slot: 0, effect: { ...slot, params: { cutoff: Number.NaN } } })).toThrow('finite number');
+    expect(() => apply(project, { type: 'mixer.channel.effect.set', channelId: 'mixer-insert-1', slot: 0, effect: { ...slot, params: { ...defaultEffectParams('eq3'), lowGainDb: Number.NaN } } })).toThrow('finite number');
     expect(apply(project, { type: 'mixer.channel.effect.set', channelId: 'mixer-insert-1', slot: 0, effect: null })).toBe(project);
   });
 });

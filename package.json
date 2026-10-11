@@ -25,6 +25,7 @@
     "jsdom": "^30.1.2",
     "typescript": "^5.9.3",
     "vite": "^7.1.7",
-    "vitest": "^5.0.3"
+    "vitest": "^5.0.3",
+    "web-audio-api": "^1.6.0"
   }
 }

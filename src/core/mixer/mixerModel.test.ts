@@ -330,7 +330,7 @@ describe('mixer state for the audio runtime', () => {
     expect(mixerStateSignature(applyProjectCommand(project, { type: 'mixer.channel.route', channelId: 'mixer-insert-1', outputId: 'mixer-insert-2' }))).not.toBe(before);
     expect(mixerStateSignature(applyProjectCommand(project, { type: 'mixer.channel.reorder', channelId: 'mixer-insert-1', toIndex: 3 }))).not.toBe(before);
     expect(mixerStateSignature(applyProjectCommand(project, { type: 'mixer.source.assign', sourceId: 'channel-kick', mixerChannelId: MASTER }))).not.toBe(before);
-    expect(mixerStateSignature(applyProjectCommand(project, { type: 'mixer.channel.effect.set', channelId: 'mixer-insert-1', slot: 0, effect: { id: 'slot-0', type: 'gain', enabled: true, params: { amount: 0.5 } } }))).not.toBe(before);
+    expect(mixerStateSignature(applyProjectCommand(project, { type: 'mixer.channel.effect.set', channelId: 'mixer-insert-1', slot: 0, effect: { id: 'slot-0', type: 'delay', enabled: true, params: { timeMs: 250, feedback: 0.35, toneHz: 4000, mix: 0.5 } } }))).not.toBe(before);
   });
 
   it('keeps the mixer signature stable for edits that cannot affect the mix', () => {

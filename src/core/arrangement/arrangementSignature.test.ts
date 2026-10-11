@@ -55,7 +55,7 @@ describe('arrangement signature', () => {
       ['mixer rename', edit(project, { type: 'mixer.channel.rename', channelId: 'mixer-insert-1', name: 'Thump' })],
       ['track assignment', edit(project, { type: 'mixer.source.assign', sourceId: 'audio:track-audio', mixerChannelId: 'mixer-insert-2' })],
       ['channel assignment', edit(project, { type: 'mixer.source.assign', sourceId: 'channel-kick', mixerChannelId: 'mixer-insert-3' })],
-      ['effect slot', edit(project, { type: 'mixer.channel.effect.set', channelId: 'mixer-insert-1', slot: 0, effect: { id: 'fx', type: 'delay', enabled: true, params: { time: 0.3 } } })],
+      ['effect slot', edit(project, { type: 'mixer.channel.effect.set', channelId: 'mixer-insert-1', slot: 0, effect: { id: 'fx', type: 'delay', enabled: true, params: { timeMs: 300, feedback: 0.35, toneHz: 4000, mix: 0.3 } } })],
       ['channel rename', edit(project, { type: 'channel.rename', channelId: 'channel-kick', name: 'Thump' })],
       ['track rename', edit(project, { type: 'playlist.track.rename', trackId: 'track-main', name: 'Lead' })],
       ['clip rename', edit(project, { type: 'playlist.clips.edit', upserts: [{ ...project.playlist[0], name: 'Intro' }] })],

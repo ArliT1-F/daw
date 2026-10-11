@@ -688,6 +688,34 @@ button:disabled { cursor: not-allowed; }
 .mixer-note { display: flex; align-items: center; gap: 8px; flex: 0 0 200px; max-width: 230px; margin: 0; padding: 0 8px; color: #798780; font-size: 9px; line-height: 1.55; }
 .deferred-indicator { width: 5px; height: 5px; flex: 0 0 5px; border-radius: 50%; background: #59655f; }
 
+/* Phase 8: FX button, limiter warning, and the effects rack overlay. */
+.mixer-fx { gap: 4px; }
+.mixer-fx-button { flex: 0 0 auto; height: 17px; padding: 0 5px; border: 1px solid #3a4544; border-radius: 3px; color: #8b9895; background: #232b2d; font-family: var(--font-mono); font-size: 8px; font-weight: 700; letter-spacing: .04em; cursor: pointer; }
+.mixer-fx-button:hover { color: var(--color-accent); border-color: #6d8268; }
+.mixer-fx-button--open, .mixer-fx-button[aria-expanded="true"] { color: #0c0f10; background: var(--color-accent); border-color: var(--color-accent); }
+.mixer-fx-slots { display: flex; align-items: center; gap: 2px; min-width: 0; }
+.mixer-limiter-warning { margin: 2px 0 0; padding: 3px 4px; border: 1px solid #7a5f2a; border-radius: 3px; color: #e0b15c; background: #2a2316; font-size: 8px; line-height: 1.4; }
+.mixer-panel { position: relative; }
+.fx-rack { position: absolute; left: 8px; right: 8px; bottom: 8px; z-index: 5; display: flex; flex-direction: column; gap: 6px; max-height: 58%; min-height: 0; padding: 8px; overflow: auto; border: 1px solid #38443f; border-radius: 4px; background: #181e20; box-shadow: 0 10px 24px rgba(0, 0, 0, .45); }
+.fx-rack-head { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.fx-rack-title { flex: 1 1 auto; min-width: 0; color: #d4ddd8; font-size: 10px; font-weight: 700; letter-spacing: .04em; text-transform: uppercase; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.fx-rack-count { color: #798780; font-family: var(--font-mono); font-size: 9px; }
+.fx-rack-add select { height: 22px; max-width: 150px; border: 1px solid #3a4544; border-radius: 3px; color: #d4ddd8; background: #232b2d; font-size: 10px; }
+.fx-rack-add select:disabled { opacity: .45; }
+.fx-rack-close { display: grid; place-items: center; width: 22px; height: 22px; padding: 0; border: 1px solid #3a4544; border-radius: 3px; color: #8b9895; background: #232b2d; cursor: pointer; }
+.fx-rack-empty, .fx-rack-note { margin: 0; color: #798780; font-size: 9px; line-height: 1.5; }
+.fx-chain { display: flex; gap: 6px; margin: 0; padding: 0; list-style: none; overflow-x: auto; }
+.fx-card { display: flex; flex: 0 0 236px; flex-direction: column; gap: 6px; min-width: 0; padding: 6px; border: 1px solid #38443f; border-radius: 3px; background: #1f2627; }
+.fx-card--bypassed { opacity: .6; }
+.fx-card-head { display: flex; align-items: center; gap: 4px; min-width: 0; }
+.fx-card-title { flex: 1 1 auto; min-width: 0; color: #d4ddd8; font-size: 10px; font-weight: 700; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.fx-card-toggle { display: inline-flex; align-items: center; gap: 3px; color: #8b9895; font-size: 9px; }
+.fx-params { display: flex; flex-direction: column; gap: 3px; }
+.fx-param { display: grid; grid-template-columns: 1fr 54px; align-items: center; gap: 2px 6px; color: #aab5ae; font-size: 9px; }
+.fx-param-label { grid-column: 1 / -1; }
+.fx-param-input { width: 100%; min-width: 0; accent-color: var(--color-accent); }
+.fx-param-value { color: #d4ddd8; font-family: var(--font-mono); font-size: 9px; text-align: right; white-space: nowrap; }
+
 .studio-footer { display: flex; align-items: center; justify-content: space-between; gap: 8px; min-width: 0; padding: 0 3px; color: #62706a; font-family: var(--font-mono); font-size: 7px; letter-spacing: .065em; white-space: nowrap; }
 .shortcut-guide { overflow: hidden; color: #78857e; text-overflow: ellipsis; text-transform: none; letter-spacing: 0; }
 .browser-panel { height: 100%; }
@@ -899,3 +927,7 @@ button:disabled { cursor: not-allowed; }
 .rack-channel-block--selected .rack-channel-info { box-shadow: inset 2px 0 0 #c9a26a; }
 .rack-sample-chip--missing { border-color: #d88b8b; color: #f0b5b5; }
 .rack-sample-chip--missing .rack-sample-name::before { content: "! "; }
+
+/* Phase 8: project Save / Open in the status bar. */
+.project-file-actions { display: flex; align-items: center; gap: 6px; margin-left: auto; }
+.project-file-button { height: 22px; padding: 0 9px; font-size: 10px; }

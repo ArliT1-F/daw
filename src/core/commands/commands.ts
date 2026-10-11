@@ -569,6 +569,11 @@ export function applyProjectCommand(project: Project, command: ProjectCommand): 
     case 'mixer.channel.solo.set':
     case 'mixer.channel.route':
     case 'mixer.channel.effect.set':
+    case 'mixer.effect.add':
+    case 'mixer.effect.remove':
+    case 'mixer.effect.move':
+    case 'mixer.effect.enabled.set':
+    case 'mixer.effect.param.set':
     case 'mixer.solo.clear':
     case 'mixer.source.assign':
       return applyMixerCommand(project, command);

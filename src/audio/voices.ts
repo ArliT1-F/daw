@@ -89,7 +89,7 @@ class WebAudioVoice implements Voice {
     readonly kind: MusicalEventKind,
     readonly startTime: number,
     endTime: number,
-    private readonly context: AudioContext,
+    private readonly context: BaseAudioContext,
     private readonly sources: AudioScheduledSourceNode[],
     private readonly gains: GainNode[],
     private readonly onEnded: (voice: Voice) => void,

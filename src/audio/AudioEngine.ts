@@ -398,6 +398,11 @@ export class BrowserAudioEngine implements AudioEngine, MusicalEventSink {
     return this.graph?.getRoutingWarnings() ?? [];
   }
 
+  /** Effects that failed to build or update. They are absent from the live mix and reported to the user. */
+  getMixerEffectWarnings(): string[] {
+    return this.graph?.getEffectWarnings() ?? [];
+  }
+
   /**
    * Read every level meter once. Callers poll this at a bounded rate (the Mixer uses ~20 Hz);
    * nothing in the engine schedules meter work on its own.
