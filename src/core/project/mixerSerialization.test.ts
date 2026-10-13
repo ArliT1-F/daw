@@ -28,7 +28,7 @@ describe('version 3 mixer persistence', () => {
     project = applyProjectCommand(project, { type: 'mixer.channel.mute.set', channelId: 'mixer-insert-3', muted: true });
     project = applyProjectCommand(project, { type: 'mixer.channel.solo.set', channelId: 'mixer-insert-4', solo: true });
     project = applyProjectCommand(project, { type: 'mixer.channel.reorder', channelId: 'mixer-insert-2', toIndex: 0 });
-    project = applyProjectCommand(project, { type: 'mixer.channel.effect.set', channelId: 'mixer-insert-2', slot: 1, effect: { id: 'fx-a', type: 'delay', enabled: true, params: { time: 0.3, feedback: 0.25 } } });
+    project = applyProjectCommand(project, { type: 'mixer.channel.effect.set', channelId: 'mixer-insert-2', slot: 1, effect: { id: 'fx-a', type: 'delay', enabled: true, params: { timeMs: 300, feedback: 0.25, toneHz: 4000, mix: 0.3 } } });
     project = applyProjectCommand(project, { type: 'mixer.source.assign', sourceId: audioSourceId(project.tracks[0].id), mixerChannelId: 'mixer-bus-a' });
     project = applyProjectCommand(project, { type: 'mixer.source.assign', sourceId: 'channel-kick', mixerChannelId: 'mixer-bus-a' });
 
@@ -176,8 +176,8 @@ describe('version 3 mixer validation', () => {
       (project) => { project.mixerChannels[1].pan = -1.01; },
       (project) => { project.mixerChannels[1].muted = 'yes' as unknown as boolean; },
       (project) => { project.mixerChannels[1].solo = 1 as unknown as boolean; },
-      (project) => { project.mixerChannels[1].effects = [{ id: 'fx', type: 'delay', enabled: true, params: { rate: Number.NaN } }]; },
-      (project) => { project.mixerChannels[1].effects = [{ id: 'fx', type: '', enabled: true, params: {} }]; },
+      (project) => { project.mixerChannels[1].effects = [{ id: 'fx', type: 'delay', enabled: true, params: { timeMs: Number.NaN } }]; },
+      (project) => { project.mixerChannels[1].effects = [{ id: 'fx', type: '' as unknown as 'delay', enabled: true, params: {} }]; },
       (project) => { project.mixerChannels[1].effects = [{ id: 'fx', type: 'delay', enabled: 'on' as unknown as boolean, params: {} }]; },
       (project) => { project.mixerChannels[1].effects = [{ id: 'fx', type: 'delay', enabled: true, params: {} }, { id: 'fx', type: 'delay', enabled: false, params: {} }]; },
       (project) => {

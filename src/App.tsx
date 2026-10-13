@@ -6,6 +6,7 @@ import { ErrorNotice } from './components/ErrorNotice';
 import { createAppError, type AppError, type ErrorSource } from './core/errors';
 import { applyProjectCommand, createProjectHistory, projectHistoryReducer, type ProjectCommand } from './core/commands';
 import { createInitialProject, createStableId, type AudioAsset } from './core/project/model';
+import { deserializeProject, serializeProject } from './core/project/serialization';
 import { buildMixerState, mixerStateSignature } from './core/mixer/mixerModel';
 import { ArrangementEventSource, buildPatternEvents } from './core/events';
 import { arrangementSignature, audioDurationTicks, getPlaybackRegion, getProjectTempoMap, getSongEndTick, patternStepAtSongPosition, songStepForPatternTick } from './core/arrangement/arrangement';
@@ -83,6 +84,15 @@ function describeImport(result: ImportedSample): string {
   return `Added "${name}".`;
 }
 
+/** Prefix on the app-level notice for effects missing from the mix, so the notice can clear itself. */
+const EFFECT_WARNING_PREFIX = 'Some effects could not be applied and are absent from the mix: ';
+
+/** A filesystem-safe name for a downloaded project, derived from the project name. */
+function projectFileBaseName(name: string): string {
+  const base = name.trim().replace(/[^A-Za-z0-9_-]+/g, '-').replace(/^-+|-+$/g, '');
+  return base || 'project';
+}
+
 function hasSubtleCrypto(): boolean {
   return typeof crypto !== 'undefined' && Boolean(crypto.subtle);
 }
@@ -124,6 +134,7 @@ export function App() {
   }
   const audioEngine = audioEngineRef.current;
   const meterRegistry = meterRegistryRef.current;
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   const [history, dispatchProject] = useReducer(
     projectHistoryReducer,
@@ -207,6 +218,14 @@ export function App() {
 
   useEffect(() => {
     audioEngine.setMixerState(mixerState);
+    // Effects that could not be built are absent from the mix. Say so, and clear the notice once fixed.
+    const effectWarnings = audioEngine.getMixerEffectWarnings();
+    setAppError((current) => {
+      if (effectWarnings.length > 0) {
+        return { source: 'audio', message: `${EFFECT_WARNING_PREFIX}${effectWarnings.join('; ')}` };
+      }
+      return current?.message?.startsWith(EFFECT_WARNING_PREFIX) ? null : current;
+    });
   }, [audioEngine, mixerState]);
 
   // Level meters poll at a bounded rate and write straight into the bound DOM nodes.
@@ -455,6 +474,47 @@ export function App() {
     dispatchTransport({ type: 'stop', positionStep: audioEngine.getPositionSteps() });
   }
 
+  /**
+   * Download the project as a `.json` document. The document carries the mixer chains and effect
+   * settings, so reopening it rebuilds the same chain. Sample audio is not embedded.
+   */
+  function handleSaveProject() {
+    try {
+      const current = projectRef.current;
+      const json = serializeProject(current);
+      const url = URL.createObjectURL(new Blob([json], { type: 'application/json' }));
+      const anchor = document.createElement('a');
+      anchor.href = url;
+      anchor.download = `${projectFileBaseName(current.name)}.json`;
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      // Revoke after the browser has started the download.
+      window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+      setAppError(null);
+    } catch (error) {
+      reportError('project', error);
+    }
+  }
+
+  /**
+   * Replace the open project with a saved one. Transport stops first, and the load is a single
+   * history `replace`, so undo cannot resurrect the previous project.
+   */
+  async function handleOpenProjectFile(file: File) {
+    try {
+      const next = deserializeProject(await file.text());
+      handleStop();
+      dispatchProject({ type: 'replace', project: next });
+      projectRef.current = next;
+      setSelectedPatternId(next.patterns[0]?.id ?? '');
+      setSelectedClipId(undefined);
+      setAppError(null);
+    } catch (error) {
+      reportError('project', error);
+    }
+  }
+
   const handleSeek = useCallback(
     (step: number) => {
       const region = getPlaybackRegion(projectRef.current);
@@ -505,9 +565,15 @@ export function App() {
     function onGlobalKeyDown(event: KeyboardEvent) {
       const target = event.target instanceof HTMLElement ? event.target : null;
       const isTextEntry = Boolean(target?.isContentEditable || target?.matches('input, textarea, select'));
+      const commandKey = event.metaKey || event.ctrlKey;
+      // Save works from anywhere, including text fields, and never auto-repeats into many downloads.
+      if (commandKey && !event.shiftKey && !event.altKey && event.key.toLowerCase() === 's') {
+        event.preventDefault();
+        if (!event.repeat) handleSaveProject();
+        return;
+      }
       if (isTextEntry || event.repeat) return;
 
-      const commandKey = event.metaKey || event.ctrlKey;
       if (commandKey && event.key.toLowerCase() === 'z') {
         event.preventDefault();
         if (event.shiftKey) handleRedo();
@@ -595,6 +661,26 @@ export function App() {
               <span className="session-name">{project.name}</span>
               <span className="session-separator">/</span>
               <span className="session-pattern">{pattern.name}</span>
+            </div>
+            <div className="project-file-actions">
+              <button aria-keyshortcuts="Control+S Meta+S" className="button project-file-button" onClick={handleSaveProject} title="Download the project as a .json file · Ctrl/Cmd+S" type="button">
+                Save
+              </button>
+              <button className="button project-file-button" onClick={() => fileInputRef.current?.click()} title="Open a saved .json project, replacing the current one" type="button">
+                Open
+              </button>
+              <input
+                accept="application/json,.json"
+                aria-label="Open project file"
+                hidden
+                onChange={(event) => {
+                  const file = event.currentTarget.files?.[0];
+                  event.currentTarget.value = '';
+                  if (file) void handleOpenProjectFile(file);
+                }}
+                ref={fileInputRef}
+                type="file"
+              />
             </div>
             <div className="foundation-notice">
               <span className="foundation-dot" />

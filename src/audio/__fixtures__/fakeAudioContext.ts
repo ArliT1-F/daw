@@ -149,6 +149,27 @@ export class FakeDynamicsCompressorNode extends FakeAudioNode {
   release = new FakeAudioParam(0.25);
 }
 
+export class FakeDelayNode extends FakeAudioNode {
+  readonly maxDelayTime: number;
+  delayTime: FakeAudioParam;
+
+  constructor(maxDelayTime = 1) {
+    super();
+    this.maxDelayTime = maxDelayTime;
+    this.delayTime = new FakeAudioParam(0);
+  }
+}
+
+export class FakeConvolverNode extends FakeAudioNode {
+  buffer: FakeAudioBuffer | null = null;
+  normalize = true;
+}
+
+export class FakeWaveShaperNode extends FakeAudioNode {
+  curve: Float32Array | null = null;
+  oversample: OverSampleType = 'none';
+}
+
 export class FakeStereoPannerNode extends FakeAudioNode {
   pan = new FakeAudioParam(0);
 }
@@ -240,6 +261,9 @@ export class FakeAudioContext {
   readonly analysers: FakeAnalyserNode[] = [];
   readonly mergers: FakeChannelMergerNode[] = [];
   readonly splitters: FakeChannelSplitterNode[] = [];
+  readonly delays: FakeDelayNode[] = [];
+  readonly convolvers: FakeConvolverNode[] = [];
+  readonly waveShapers: FakeWaveShaperNode[] = [];
   /** Absent (not merely unused) when the context does not support stereo panning. */
   readonly createStereoPanner: (() => FakeStereoPannerNode) | undefined;
   resumeCount = 0;
@@ -250,6 +274,10 @@ export class FakeAudioContext {
   /** Next decodeAudioData() rejects, as an unsupported codec would. */
   failNextDecode = false;
   decodeCount = 0;
+  /** Offline-only: channel count and length the context was created with, and render calls made. */
+  channelCount = 2;
+  renderLength = 0;
+  renderCount = 0;
 
   constructor(options: FakeContextOptions = {}) {
     this.sampleRate = options.sampleRate ?? 48000;
@@ -268,7 +296,8 @@ export class FakeAudioContext {
     return (
       this.gains.length + this.oscillators.length + this.bufferSources.length + this.filters.length +
       this.compressors.length + this.stereoPanners.length + this.analysers.length +
-      this.mergers.length + this.splitters.length
+      this.mergers.length + this.splitters.length + this.delays.length + this.convolvers.length +
+      this.waveShapers.length
     );
   }
 
@@ -385,9 +414,45 @@ export class FakeAudioContext {
     return node;
   }
 
+  createDelay(maxDelayTime = 1): FakeDelayNode {
+    const node = new FakeDelayNode(maxDelayTime);
+    this.delays.push(node);
+    return node;
+  }
+
+  createConvolver(): FakeConvolverNode {
+    const node = new FakeConvolverNode();
+    this.convolvers.push(node);
+    return node;
+  }
+
+  createWaveShaper(): FakeWaveShaperNode {
+    const node = new FakeWaveShaperNode();
+    this.waveShapers.push(node);
+    return node;
+  }
+
   createBuffer(numberOfChannels: number, length: number, sampleRate: number): FakeAudioBuffer {
     return new FakeAudioBuffer(numberOfChannels, length, sampleRate);
   }
+
+  /**
+   * Offline rendering double. Returns a silent buffer of the requested length. Tests that need real
+   * samples use `web-audio-api` (see `offlineRender.test.ts`); this double only proves the graph
+   * builds, connects, and disposes on an offline context.
+   */
+  async startRendering(): Promise<FakeAudioBuffer> {
+    this.renderCount += 1;
+    return new FakeAudioBuffer(this.channelCount, this.renderLength, this.sampleRate);
+  }
+}
+
+/** Offline counterpart of `createFakeAudioContext`: same double, sized like an OfflineAudioContext. */
+export function createFakeOfflineContext(request: { channels: number; length: number; sampleRate: number }): FakeContextBundle & { fake: FakeAudioContext } {
+  const fake = new FakeAudioContext({ sampleRate: request.sampleRate, startRunning: true });
+  fake.channelCount = request.channels;
+  fake.renderLength = request.length;
+  return { context: fake as unknown as AudioContext, fake };
 }
 
 export interface FakeContextBundle {

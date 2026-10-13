@@ -1,5 +1,6 @@
 import {
   assertValidProject,
+  createMixerEffect,
   createMixerEffectSlot,
   MASTER_MIXER_CHANNEL_ID,
   MAX_MIXER_INSERTS,
@@ -11,6 +12,14 @@ import {
   type MixerEffectSlot,
   type Project,
 } from '../project/model';
+import {
+  getEffectDefinition,
+  getEffectParamSpec,
+  isEffectType,
+  isEffectValueInRange,
+  validateEffectParams,
+  type EffectType,
+} from '../effects/effectDefinitions';
 import {
   findRoutingIssue,
   getInsertChannels,
@@ -40,8 +49,15 @@ export type MixerCommand =
   | { type: 'mixer.channel.mute.set'; channelId: string; muted: boolean }
   | { type: 'mixer.channel.solo.set'; channelId: string; solo: boolean }
   | { type: 'mixer.channel.route'; channelId: string; outputId: string }
-  /** Phase 7 hook: place, replace, or clear (`effect: null`) one prepared effect slot. */
+  /** Place, replace, or clear (`effect: null`) one entry of a channel's chain by position. Legacy. */
   | { type: 'mixer.channel.effect.set'; channelId: string; slot: number; effect: MixerEffectSlot | null }
+  /** Append (or insert at `index`) a new effect at its defaults. Enabled on creation. */
+  | { type: 'mixer.effect.add'; channelId: string; effectId: string; effectType: EffectType; index?: number }
+  | { type: 'mixer.effect.remove'; channelId: string; effectId: string }
+  /** `toIndex` is the position within the channel's effect chain. */
+  | { type: 'mixer.effect.move'; channelId: string; effectId: string; toIndex: number }
+  | { type: 'mixer.effect.enabled.set'; channelId: string; effectId: string; enabled: boolean }
+  | { type: 'mixer.effect.param.set'; channelId: string; effectId: string; key: string; value: number }
   | { type: 'mixer.solo.clear' }
   /** Route a Channel Rack channel or a Playlist track (`audio:<trackId>`) to a mixer channel. */
   | { type: 'mixer.source.assign'; sourceId: string; mixerChannelId: string };
@@ -103,6 +119,31 @@ function trimEffectSlots(effects: MixerEffectSlot[]): MixerEffectSlot[] {
     trimmed.pop();
   }
   return trimmed;
+}
+
+/** Real effects only, in chain order. Placeholder slots are dropped by every chain-editing command. */
+function realEffects(effects: readonly MixerEffectSlot[]): MixerEffectSlot[] {
+  return effects.filter((slot) => slot.type !== null).map((slot) => ({ ...slot, params: { ...slot.params } }));
+}
+
+function requireEffectId(value: string): string {
+  if (typeof value !== 'string' || !value.trim()) throw new ProjectCommandError('A mixer effect needs an ID.');
+  return value.trim();
+}
+
+function findEffect(effects: readonly MixerEffectSlot[], effectId: string, channel: MixerChannel): number {
+  const index = effects.findIndex((slot) => slot.id === effectId);
+  if (index < 0) throw new ProjectCommandError(`Effect "${effectId}" is not on mixer channel ${channel.name}.`);
+  return index;
+}
+
+/** Reject an effect type the channel cannot host, such as the limiter on an insert. */
+function assertEffectAllowed(channel: MixerChannel, effectType: unknown): asserts effectType is EffectType {
+  if (!isEffectType(effectType)) throw new ProjectCommandError(`Unknown effect type "${String(effectType)}".`);
+  const definition = getEffectDefinition(effectType);
+  if (definition.masterOnly && channel.role !== 'master') {
+    throw new ProjectCommandError(`${definition.label} can only be placed on the master bus.`);
+  }
 }
 
 export function applyMixerCommand(project: Project, command: MixerCommand): Project {
@@ -228,11 +269,92 @@ export function applyMixerCommand(project: Project, command: MixerCommand): Proj
         if (effects.some((slot, index) => index !== command.slot && slot.id === effect.id)) {
           throw new ProjectCommandError('Mixer effect slot IDs must be unique within a channel.');
         }
+        if (effect.type !== null) {
+          assertEffectAllowed(channel, effect.type);
+          const issue = validateEffectParams(effect.type, effect.params);
+          if (issue) throw new ProjectCommandError(issue);
+        }
         effects[command.slot] = { ...effect, params: { ...effect.params } };
       }
       const trimmed = trimEffectSlots(effects);
       if (JSON.stringify(trimmed) === JSON.stringify(channel.effects)) return project;
       next = updateMixerChannel(project, command.channelId, (current) => ({ ...current, effects: trimmed }));
+      break;
+    }
+
+    case 'mixer.effect.add': {
+      const channel = requireMixerChannel(project, command.channelId);
+      assertEffectAllowed(channel, command.effectType);
+      const effectId = requireEffectId(command.effectId);
+      const effects = realEffects(channel.effects);
+      if (effects.some((slot) => slot.id === effectId)) {
+        throw new ProjectCommandError('Mixer effect IDs must be unique within a channel.');
+      }
+      if (effects.length >= MIXER_EFFECT_SLOT_COUNT) {
+        throw new ProjectCommandError(`A mixer channel supports at most ${MIXER_EFFECT_SLOT_COUNT} effects.`);
+      }
+      const index = command.index ?? effects.length;
+      if (!Number.isInteger(index) || index < 0 || index > effects.length) {
+        throw new ProjectCommandError('Effect position is outside the chain.');
+      }
+      const added = createMixerEffect(effectId, command.effectType, true);
+      next = updateMixerChannel(project, command.channelId, (current) => ({
+        ...current,
+        effects: [...effects.slice(0, index), added, ...effects.slice(index)],
+      }));
+      break;
+    }
+
+    case 'mixer.effect.remove': {
+      const channel = requireMixerChannel(project, command.channelId);
+      const effects = realEffects(channel.effects);
+      const index = findEffect(effects, command.effectId, channel);
+      next = updateMixerChannel(project, command.channelId, (current) => ({
+        ...current,
+        effects: effects.filter((_, position) => position !== index),
+      }));
+      break;
+    }
+
+    case 'mixer.effect.move': {
+      const channel = requireMixerChannel(project, command.channelId);
+      const effects = realEffects(channel.effects);
+      const from = findEffect(effects, command.effectId, channel);
+      if (!Number.isInteger(command.toIndex) || command.toIndex < 0 || command.toIndex >= effects.length) {
+        throw new ProjectCommandError('Effect position is outside the chain.');
+      }
+      if (from === command.toIndex) return project;
+      const [moved] = effects.splice(from, 1);
+      effects.splice(command.toIndex, 0, moved);
+      next = updateMixerChannel(project, command.channelId, (current) => ({ ...current, effects }));
+      break;
+    }
+
+    case 'mixer.effect.enabled.set': {
+      const channel = requireMixerChannel(project, command.channelId);
+      const effects = realEffects(channel.effects);
+      const index = findEffect(effects, command.effectId, channel);
+      const enabled = requireBoolean(command.enabled, 'Effect enabled state');
+      if (effects[index].enabled === enabled) return project;
+      effects[index] = { ...effects[index], enabled };
+      next = updateMixerChannel(project, command.channelId, (current) => ({ ...current, effects }));
+      break;
+    }
+
+    case 'mixer.effect.param.set': {
+      const channel = requireMixerChannel(project, command.channelId);
+      const effects = realEffects(channel.effects);
+      const index = findEffect(effects, command.effectId, channel);
+      const effect = effects[index];
+      if (!effect.type) throw new ProjectCommandError('Placeholder effects have no parameters.');
+      const spec = getEffectParamSpec(effect.type, command.key);
+      if (!spec) throw new ProjectCommandError(`${getEffectDefinition(effect.type).label} has no parameter "${String(command.key)}".`);
+      if (!isEffectValueInRange(spec, command.value)) {
+        throw new ProjectCommandError(`${spec.label} must be between ${spec.min} and ${spec.max}${spec.unit ? ` ${spec.unit}` : ''}.`);
+      }
+      if (effect.params[spec.key] === command.value) return project;
+      effects[index] = { ...effect, params: { ...effect.params, [spec.key]: command.value } };
+      next = updateMixerChannel(project, command.channelId, (current) => ({ ...current, effects }));
       break;
     }
 

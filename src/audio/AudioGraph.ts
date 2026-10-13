@@ -30,11 +30,16 @@ import {
   type MixerState,
 } from '../core/mixer/mixerModel';
 import { MeterBank, type MeterReading } from './metering';
-import { MixerBus, SourceStrip, type AudioEffectProcessor } from './mixerNodes';
+import { MixerBus, SourceStrip, type AudioEffectProcessor, type EffectSlotSpec } from './mixerNodes';
+import { createEffectProcessor } from './effects/effectProcessor';
 
 export interface AudioGraphOptions {
   /** Linear master gain, used until a mixer state is applied. */
   masterGain?: number;
+  /** Master pan at construction. Passing the state's value avoids a pan ramp at time zero. */
+  masterPan?: number;
+  /** False starts the master gated, matching a muted master. */
+  masterAudible?: boolean;
   /** Attach in-line analysers for level metering (default true). */
   metering?: boolean;
 }
@@ -53,6 +58,14 @@ export interface MixerGraphStats {
   routeChanges: number;
   /** Times an unresolvable destination fell back to the master bus. */
   routingFallbacks: number;
+  /** Effect processors built. A parameter edit or reorder adds none. */
+  effectsCreated: number;
+  /** Effect processors released (removed, type-changed, or on channel removal). */
+  effectsDisposed: number;
+  /** Parameter writes and bypass ramps issued to live effects. */
+  effectParamUpdates: number;
+  /** Effect chains whose connections were rebuilt. */
+  effectRewires: number;
 }
 
 export interface SyncMixerOptions {
@@ -65,7 +78,7 @@ export interface SyncMixerOptions {
 }
 
 export class AudioGraph {
-  readonly context: AudioContext;
+  readonly context: BaseAudioContext;
   readonly limiter: DynamicsCompressorNode;
   /** The single master bus. Its identity is fixed; only its mixer channel id changes. */
   readonly masterBus: MixerBus;
@@ -75,6 +88,7 @@ export class AudioGraph {
   private readonly strips = new Map<string, SourceStrip>();
   private readonly meters = new MeterBank();
   private readonly warnings = new Set<string>();
+  private readonly effectWarnings = new Set<string>();
   private readonly stats: MixerGraphStats = {
     syncs: 0,
     busesCreated: 0,
@@ -84,12 +98,16 @@ export class AudioGraph {
     paramUpdates: 0,
     routeChanges: 0,
     routingFallbacks: 0,
+    effectsCreated: 0,
+    effectsDisposed: 0,
+    effectParamUpdates: 0,
+    effectRewires: 0,
   };
   private masterId = MASTER_MIXER_CHANNEL_ID;
   private noiseBuffer: AudioBuffer | null = null;
   private disposed = false;
 
-  constructor(context: AudioContext, options: AudioGraphOptions = {}) {
+  constructor(context: BaseAudioContext, options: AudioGraphOptions = {}) {
     this.context = context;
     this.meteringEnabled = options.metering !== false;
     this.limiter = context.createDynamicsCompressor();
@@ -105,6 +123,8 @@ export class AudioGraph {
       id: 'master',
       role: 'master',
       initialVolume: masterGain,
+      initialPan: options.masterPan ?? 0,
+      initialAudible: options.masterAudible ?? true,
       metering: this.meteringEnabled,
     });
     // Fixed for the graph's lifetime: nothing in the mixer can reroute or bypass this.
@@ -187,9 +207,20 @@ export class AudioGraph {
   }
 
   /**
-   * Phase 7 hook: install (or clear, with an empty list) a bus's effect-slot chain. The fader, pan,
-   * meter, and routing are untouched, so inserting an effect never rebuilds the channel.
+   * Effects that could not be built or updated. Such an effect is left out of its chain and reported
+   * here, so a failure is visible rather than a silent bypass. Offline rendering refuses to run while
+   * this list is non-empty.
    */
+  getEffectWarnings(): string[] {
+    return [...this.effectWarnings];
+  }
+
+  /** The live processor for an effect on a mixer channel, or undefined. */
+  getEffectProcessor(mixerChannelId: string, effectId: string): AudioEffectProcessor | undefined {
+    return this.getBus(mixerChannelId)?.getEffectInstance(effectId);
+  }
+
+  /** Lower-level hook: install an explicit processor list on a bus. Prefer `syncMixer`, which owns effects. */
   setEffectChain(mixerChannelId: string, processors: readonly AudioEffectProcessor[]): boolean {
     const bus = this.getBus(mixerChannelId);
     return bus ? bus.setEffectChain(processors) : false;
@@ -204,6 +235,8 @@ export class AudioGraph {
   syncMixer(state: MixerState, options: SyncMixerOptions = {}): void {
     if (this.disposed) return;
     this.stats.syncs += 1;
+    // Effect problems are recomputed from this sync's chains, so a fixed effect stops being reported.
+    this.effectWarnings.clear();
     const now = this.context.currentTime;
     this.adoptMasterChannelId(state.masterChannelId);
 
@@ -222,6 +255,7 @@ export class AudioGraph {
       if (wanted.has(id)) continue;
       this.repointFeeders(bus, this.masterBus.input);
       this.meters.detach(id);
+      this.stats.effectsDisposed += bus.effectCount;
       bus.dispose();
       this.buses.delete(id);
       this.stats.busesDisposed += 1;
@@ -235,6 +269,7 @@ export class AudioGraph {
       this.stats.paramUpdates += this.masterBus.setVolumeDb(masterState.volumeDb, now);
       this.stats.paramUpdates += this.masterBus.setPan(masterState.pan, now);
       this.stats.paramUpdates += this.masterBus.setAudible(!masterState.muted, now);
+      this.applyBusEffects(this.masterBus, masterState.effects, now);
     }
 
     const sourceIds = new Set<string>();
@@ -285,6 +320,7 @@ export class AudioGraph {
       if (bus.connectTo(this.resolveBus(channel.outputId ?? this.masterId, `mixer channel "${channel.id}"`).input)) {
         this.stats.routeChanges += 1;
       }
+      this.applyBusEffects(bus, channel.effects, now);
       return;
     }
     const destination = this.resolveBus(channel.outputId ?? this.masterId, `mixer channel "${channel.id}"`);
@@ -292,6 +328,27 @@ export class AudioGraph {
     this.stats.paramUpdates += existing.setVolumeDb(channel.volumeDb, now);
     this.stats.paramUpdates += existing.setPan(channel.pan, now);
     this.stats.paramUpdates += existing.setAudible(audible, now);
+    this.applyBusEffects(existing, channel.effects, now);
+  }
+
+  /**
+   * Make a bus's live effect chain match its project chain. Placeholder slots are unity bypasses and
+   * are skipped. Failures are recorded as warnings and the effect is left out, never silently kept.
+   */
+  private applyBusEffects(bus: MixerBus, effects: MixerChannelState['effects'], now: number): void {
+    const slots: EffectSlotSpec[] = [];
+    for (const slot of effects) {
+      if (slot.type === null) continue;
+      slots.push({ id: slot.id, type: slot.type, enabled: slot.enabled, params: slot.params });
+    }
+    const report = bus.syncEffects(slots, (slot) => createEffectProcessor(this.context, slot), now);
+    this.stats.effectsCreated += report.created;
+    this.stats.effectsDisposed += report.disposed;
+    this.stats.effectParamUpdates += report.paramUpdates;
+    if (report.rewired) this.stats.effectRewires += 1;
+    for (const message of report.errors) {
+      this.effectWarnings.add(`${bus.id}: ${message}`);
+    }
   }
 
   private resolveBus(mixerChannelId: string, description: string): MixerBus {
@@ -368,9 +425,11 @@ export class AudioGraph {
     this.strips.clear();
     for (const bus of this.buses.values()) bus.dispose();
     this.buses.clear();
+    // Disposing the master also releases its effect processors.
     this.masterBus.dispose();
     this.meters.clear();
     this.warnings.clear();
+    this.effectWarnings.clear();
     try {
       this.limiter.disconnect();
     } catch {

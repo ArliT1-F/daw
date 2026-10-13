@@ -1,5 +1,14 @@
 import { TICKS_PER_STEP } from '../time/ticks';
 import { assertValidChannelSynth, createChannelSynth, type ChannelSynth } from '../instruments/synthModel';
+import {
+  defaultEffectParams,
+  EFFECT_DEFINITIONS,
+  isEffectType,
+  MAX_EFFECTS_PER_CHANNEL,
+  validateEffectParams,
+  type EffectParams,
+  type EffectType,
+} from '../effects/effectDefinitions';
 
 export const PROJECT_FORMAT = 'gridline-project' as const;
 export const PROJECT_VERSION = 3 as const;
@@ -22,8 +31,11 @@ export const MIXER_DEFAULT_DB = 0;
 export const MIXER_PAN_LIMIT = 1;
 /** Upper bound on non-master mixer channels, so a project cannot grow an unbounded node graph. */
 export const MAX_MIXER_INSERTS = 32;
-/** Prepared effect slots per mixer channel. Phase 7 fills them with real processors. */
-export const MIXER_EFFECT_SLOT_COUNT = 4;
+/**
+ * Effects per mixer channel (the chain capacity). Kept under its historical name: the document's
+ * `effects` array is the ordered chain, and empty placeholder slots never count toward it.
+ */
+export const MIXER_EFFECT_SLOT_COUNT = MAX_EFFECTS_PER_CHANNEL;
 /** Mixer channel and source names share the Playlist track limit. */
 export const MAX_MIXER_NAME_LENGTH = 80;
 /**
@@ -181,20 +193,19 @@ export interface AudioClip extends PlaylistClipBase {
 export type PlaylistClip = PatternClip | AudioClip;
 
 /**
- * One prepared effect slot in a mixer channel's insert chain.
+ * One entry in a mixer channel's ordered effect chain.
  *
- * Phase 6 stores and validates the slot but does not process audio with it: an empty slot is a
- * unity bypass in the graph. Phase 7 replaces `type: null` with a processor definition without
- * changing the document shape or rewiring the channel.
+ * `type` selects an effect from `EFFECT_DEFINITIONS`; `params` holds that effect's complete
+ * parameter record in physical units (dB, Hz, ms, ...). A disabled effect is bypassed without being
+ * removed. `type: null` is a legacy empty placeholder (a unity bypass); the effect commands drop
+ * placeholders when they edit a chain, and the graph never builds one.
  */
 export interface MixerEffectSlot {
   id: string;
-  /** Processor type key, or `null` while the slot is an empty bypass. */
-  type: string | null;
-  /** A disabled slot is bypassed even when a processor type is assigned. */
+  type: EffectType | null;
+  /** A disabled effect is bypassed even though it stays in the chain. */
   enabled: boolean;
-  /** Normalised processor parameters; interpreted by the processor, never by the graph. */
-  params: Record<string, number>;
+  params: EffectParams;
 }
 
 export interface MixerChannel {
@@ -215,7 +226,7 @@ export interface MixerChannel {
    * insert reaches the master exactly once.
    */
   outputId?: string;
-  /** Prepared insert-effect slots, in signal order. Bounded by `MIXER_EFFECT_SLOT_COUNT`. */
+  /** Ordered insert-effect chain, in signal order. Bounded by `MIXER_EFFECT_SLOT_COUNT`. */
   effects: MixerEffectSlot[];
 }
 
@@ -232,6 +243,11 @@ export function createMasterMixerChannel(id: string, name = 'Master'): MixerChan
 /** An empty, bypassed effect slot for a mixer channel's insert chain. */
 export function createMixerEffectSlot(id: string): MixerEffectSlot {
   return { id, type: null, enabled: false, params: {} };
+}
+
+/** A new effect at its documented defaults. Enabled, so adding it is immediately audible. */
+export function createMixerEffect(id: string, type: EffectType, enabled = true): MixerEffectSlot {
+  return { id, type, enabled, params: defaultEffectParams(type) };
 }
 
 /** Serializable project content only. UI selections and live audio objects never belong here. */
@@ -494,33 +510,37 @@ export function assertValidSampleTrim(value: unknown, durationSeconds: number | 
   ensure(Number.isFinite(gain) && Number(gain) >= 0 && Number(gain) <= SAMPLE_GAIN_MAX, `Sample gain for ${label} must be between 0 and ${SAMPLE_GAIN_MAX}.`);
 }
 
-/** Validate one mixer channel's prepared effect-slot chain. Slots are data only until Phase 7. */
-function assertValidEffectSlots(value: unknown, channelName: string): void {
+/**
+ * Validate one mixer channel's effect chain.
+ *
+ * Each typed effect must name a known effect, be allowed on this bus, and carry exactly that effect's
+ * parameters, each finite and inside its range. Legacy empty placeholders (`type: null`) stay valid.
+ */
+function assertValidEffectSlots(value: unknown, channelName: string, role: string): void {
   ensure(Array.isArray(value), `Mixer channel ${channelName} effect slots must be an array.`);
   ensure(
     value.length <= MIXER_EFFECT_SLOT_COUNT,
-    `Mixer channel ${channelName} has more than ${MIXER_EFFECT_SLOT_COUNT} effect slots.`,
+    `Mixer channel ${channelName} has more than ${MIXER_EFFECT_SLOT_COUNT} effects.`,
   );
   const slotIds = new Set<string>();
   for (const slot of value) {
-    ensure(isRecord(slot), `Mixer channel ${channelName} has an invalid effect slot.`);
+    ensure(isRecord(slot), `Mixer channel ${channelName} has an invalid effect.`);
     ensure(
       typeof slot.id === 'string' && slot.id.trim().length > 0 && !slotIds.has(slot.id),
-      `Mixer channel ${channelName} effect slot IDs must be unique, non-empty strings.`,
+      `Mixer channel ${channelName} effect IDs must be unique, non-empty strings.`,
     );
     slotIds.add(String(slot.id));
-    ensure(
-      slot.type === null || (typeof slot.type === 'string' && slot.type.trim().length > 0),
-      `Mixer channel ${channelName} has an invalid effect type.`,
-    );
-    ensure(typeof slot.enabled === 'boolean', `Mixer channel ${channelName} effect slot state must be a boolean.`);
+    ensure(slot.type === null || isEffectType(slot.type), `Mixer channel ${channelName} has an unknown effect type.`);
+    ensure(typeof slot.enabled === 'boolean', `Mixer channel ${channelName} effect enabled state must be a boolean.`);
     ensure(isRecord(slot.params), `Mixer channel ${channelName} effect parameters must be an object.`);
-    for (const [key, param] of Object.entries(slot.params)) {
-      ensure(
-        key.trim().length > 0 && Number.isFinite(param),
-        `Mixer channel ${channelName} effect parameter "${key}" must be a finite number.`,
-      );
-    }
+    if (slot.type === null) continue;
+    const definition = EFFECT_DEFINITIONS[slot.type];
+    ensure(
+      !definition.masterOnly || role === 'master',
+      `${definition.label} can only be placed on the master bus (channel ${channelName}).`,
+    );
+    const issue = validateEffectParams(slot.type, slot.params);
+    ensure(issue === null, `Mixer channel ${channelName}: ${issue}`);
   }
 }
 
@@ -565,7 +585,7 @@ export function assertValidMixerChannels(value: unknown): void {
         `Mixer channel ${String(mixerChannel.name)} needs a destination mixer channel.`,
       );
     }
-    assertValidEffectSlots(mixerChannel.effects, String(mixerChannel.name));
+    assertValidEffectSlots(mixerChannel.effects, String(mixerChannel.name), String(mixerChannel.role));
   }
   ensureUniqueIds(value as Array<{ id: string }>, 'Mixer channel');
   ensure(isRecord(value[0]) && value[0].role === 'master', 'The first mixer channel must be the master bus.');

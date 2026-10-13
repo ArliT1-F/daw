@@ -129,13 +129,13 @@ Native audio boundaries use short fades; synths keep their normal release within
 
 Output latency (typically 10–40 ms, more over Bluetooth) is reported and compensated in the visible playhead. Worker timers reduce background-tab starvation but cannot prevent all browser throttling, context suspension, or main-thread stalls. Web Audio offers no output-device selection. The Rack highlights sixteenth cells; the Playlist/Piano Roll draw continuous/tick-accurate positions from the same clock.
 
-Tempo markers are supported. Mixer faders, pan, mute/solo, routing, and metering are live; per-parameter effect automation remains deferred.
+Tempo markers are supported. Mixer faders, pan, mute/solo, routing, metering, and the Phase 8 effects rack are live; effect parameter automation remains deferred.
 
 ## Verification
 
 The implementation was actually checked with:
 
-- **`npm test`: 43 files, 541 tests passed** (up from 36 files / 444 tests before Phase 7). Phase 7 adds sample import and identity (`sampleStore`, `sampleReuse`, decode errors, relink), sample-pack manifest rejection, checksum and size mismatch, `loadSamplePack` with a fake fetch and import, a check of the shipped kit against its files on disk, voice caps (96 total, 16 per channel, oldest stolen, sweep after end time), pool cleanup, synth note on/off, polyphony, pitch and detune, ADSR breakpoints, synth edits not releasing held notes, preset parse and reject cases, arrangement-signature exclusions, audition through channel region and gain, the library/inspector/synth UI, and an App-level integration test (`src/App.phase7.test.tsx`). Earlier phases: includes the existing Channel Rack, Piano Roll, Playlist, and engine suites, plus the Phase 6 additions: mixer model maths/routing/cycle detection and signatures, mixer commands and history coalescing, mixer serialization and v2→v3 migration, mixer-graph topology/diff/dispose, meter ballistics and bank, mixer playback routing and lifecycle, the Mixer panel UI, and App mixer wiring.
+- **`npm test`: 53 files, 640 tests passed** (up from 43 files / 541 tests before Phase 8). Phase 8 adds effect definitions and validation, effect and mixer commands, load-time defaults, the effect processor lifecycle (gating, idle disconnect, debounced reverb rebuilds, dispose) and graph chains (creation, in-place parameter edits, reorders, type changes, removals, warnings) on the fake context, reverb impulse determinism and caching, an offline-render lifecycle suite, real offline renders through `web-audio-api` (limiter ceiling, delay timing, EQ gain at 1 kHz, reverb tail, determinism, JSON round trip, refusal of missing effects), the effects rack UI, and App Save/Open/Ctrl+S with effect-warning notices (`src/App.phase8.test.tsx`). Earlier phases: 43 files / 541 tests after Phase 7, which added sample import and identity, sample packs, voice caps, the synth, and the App-level integration test (`src/App.phase7.test.tsx`). Phase 6 covered the mixer model, commands, serialization, graph topology, meters, playback routing, the Mixer panel, and App wiring. Phase 7 adds sample import and identity (`sampleStore`, `sampleReuse`, decode errors, relink), sample-pack manifest rejection, checksum and size mismatch, `loadSamplePack` with a fake fetch and import, a check of the shipped kit against its files on disk, voice caps (96 total, 16 per channel, oldest stolen, sweep after end time), pool cleanup, synth note on/off, polyphony, pitch and detune, ADSR breakpoints, synth edits not releasing held notes, preset parse and reject cases, arrangement-signature exclusions, audition through channel region and gain, the library/inspector/synth UI, and an App-level integration test (`src/App.phase7.test.tsx`). Earlier phases: includes the existing Channel Rack, Piano Roll, Playlist, and engine suites, plus the Phase 6 additions: mixer model maths/routing/cycle detection and signatures, mixer commands and history coalescing, mixer serialization and v2→v3 migration, mixer-graph topology/diff/dispose, meter ballistics and bank, mixer playback routing and lifecycle, the Mixer panel UI, and App mixer wiring.
 - **`npm run typecheck`: passed**, including the browser test code/configuration.
 - **`npm run build`: passed**, producing the production bundle.
 - **`npm run test:browser`: 9 Chromium specs** (5 Playlist + 4 Mixer), **not run in the Phase 7 sandbox**: Playwright could not download Chromium there (`Failed to download Chrome for Testing`). No new browser specs were added for Phase 7; the same flows are covered by the jsdom integration test above. The browser specs still need a run on a machine with Chromium. The mixer specs measure the real master-output signal and assert the master fader gates it, insert mute/solo gate it before the master bus, rerouting keeps it audible, and the meters go live while playing. Requires `npx playwright install chromium`.
@@ -168,8 +168,8 @@ voices → source strip → mixer bus (effect slots → fader → pan → meter)
 ```
 
 - Every Channel Rack channel and every Playlist track is a **source strip** with exactly one send target, so no source can reach the master twice or through two paths. Playlist audio clips route by track (`audio:<trackId>`); pattern/sample voices route by their rack channel.
-- Each **mixer bus** carries a stable effect-slot chain (a unity bypass until Phase 7), a dB **fader** (-60…+12 dB), a **pan** control (StereoPannerNode, with an equal-power fallback), and an in-line **analyser** for metering. Mute/solo are implemented as a smooth gain gate on the bus, never as a disconnect, so gating can't bypass the master.
-- The **master bus** has a fader and an output meter, is pinned last, cannot be rerouted, and always feeds the safety limiter and the hardware output. `syncMixer` never touches that connection.
+- Each **mixer bus** carries a stable effect-slot chain (empty slots are unity bypasses; Phase 8 effects run in the chain), a dB **fader** (-60…+12 dB), a **pan** control (StereoPannerNode, with an equal-power fallback), and an in-line **analyser** for metering. Mute/solo are implemented as a smooth gain gate on the bus, never as a disconnect, so gating can't bypass the master.
+- The **master bus** has an effect chain (Phase 8), a fader, and an output meter, is pinned last, cannot be rerouted, and always feeds the safety limiter and the hardware output. `syncMixer` never touches that connection.
 
 ### Routing rules
 
@@ -185,7 +185,63 @@ voices → source strip → mixer bus (effect slots → fader → pan → meter)
 
 ### Persistence
 
-Mixer channels (name, role, fader, pan, mute/solo, destination, and prepared effect slots) and track/channel assignments are part of the versioned project document (**v3**, migrated from v2/v1). Every mixer edit is an undoable command and round-trips through JSON.
+Mixer channels (name, role, fader, pan, mute/solo, destination, and effect chains) and track/channel assignments are part of the versioned project document (**v3**, migrated from v2/v1). Every mixer edit is an undoable command and round-trips through JSON.
+
+## Mixer effects — Phase 8
+
+Each mixer channel holds up to **4 effects**, in signal order. The master bus can host any effect; the limiter is master-only.
+
+| Effect | Parameters (default) | Native processing |
+| --- | --- | --- |
+| 3-Band EQ | low shelf 200 Hz ±15 dB; peaking mid 1 kHz ±15 dB, Q 0.2–8; high shelf 6 kHz ±15 dB (all 0 dB) | three `BiquadFilterNode`s |
+| Reverb | decay 0.2–5 s (1.8 s), pre-delay 0–200 ms (15 ms), tone 500 Hz–18 kHz (7 kHz), wet mix (25%) | `ConvolverNode` with a generated, seeded stereo impulse, plus pre-delay and a tone lowpass |
+| Delay | time 1–1500 ms (375 ms), feedback 0–95% (35%), repeat tone (4 kHz), wet mix (30%) | `DelayNode` with a damped feedback loop |
+| Compressor | threshold −60…0 dB (−18), ratio 1–20 (4), knee, attack, release, makeup 0–24 dB (0 dB) | `DynamicsCompressorNode` and makeup `GainNode`; default settings leave the level unchanged |
+| Limiter (master) | ceiling −12…0 dB (−1 dB), release 10–500 ms (120 ms) | `DynamicsCompressorNode` (ratio 20, 1 ms attack) then a `WaveShaperNode` hard clip at the ceiling |
+
+Definitions and validation live in `src/core/effects/effectDefinitions.ts`, with no audio or UI imports. Parameter values are stored as typed numbers, validated on every command and on load, and filled from defaults when a saved parameter is missing.
+
+### Lifecycle
+
+- Each effect is an `EffectProcessor` (`src/audio/effects/effectProcessor.ts`), keyed by its stable effect id. A bus keeps its live processors across edits.
+- **Parameter edit:** one smoothed update (20 ms time constant); no node is created. **Bypass:** dry and wet gains ramp over about 12 ms; the processing path is disconnected 250 ms after bypass, so an idle effect costs no CPU. Re-enabling reconnects it.
+- **Reorder:** the chain is rewired; processors are kept. **Type change or removal:** the old processor is disconnected from the chain, then disposed. **Channel removal:** its effects are disposed with it.
+- Reverb decay changes rebuild the impulse after 120 ms of quiet, then crossfade between convolvers over 60 ms, so a drag never stacks rebuilds.
+- An effect that cannot be built or updated is left out of its chain and reported through `getEffectWarnings()`. The app surfaces that as a visible notice; it is never silently bypassed.
+
+### Live playback and offline rendering
+
+| Effect | Live | Offline render (`renderMixOffline`) |
+| --- | --- | --- |
+| 3-Band EQ | yes | yes |
+| Reverb | yes | yes |
+| Delay | yes | yes |
+| Compressor | yes | yes |
+| Limiter (master) | yes | yes |
+
+Live and offline use the same `AudioGraph` and the same effect cores, so the render is the live chain. The offline path (`src/audio/offlineRender.ts`) runs on an `OfflineAudioContext` supplied by the caller. It **refuses to render** when any effect failed to build, and names the failures, unless the caller passes `allowMissingEffects`. An effect therefore cannot disappear from an export without being reported.
+
+Offline rendering is a library function with tests. There is no export or bounce button in this phase.
+
+### Levels
+
+- Each bus runs `effects → fader → pan → meter`, so the master limiter (when present) sits in the master chain **before** the master fader. The existing safety compressor after the master bus (threshold −6 dB, ratio 12) is unchanged and remains the last stage.
+- A master fader above 0 dB shows a warning. The limiter cannot protect a boost applied after it; with no limiter, only the safety compressor applies.
+
+### Save and open
+
+- **Save** (button or Ctrl/Cmd+S) downloads the project as `<name>.json`, with the effect chains, parameters, and bypass states.
+- **Open** reads a saved `.json` file, stops the transport, and replaces the open project as one history entry, so Undo does not restore the previous project. An unreadable or invalid file is reported and leaves the project unchanged.
+- Sample audio is not embedded in the document (see Current limits).
+
+### Known audio limitations
+
+- **Limiter:** the native compressor has no lookahead, so the first milliseconds of a sharp transient are caught by the hard clip. That keeps the output at or below the ceiling, but a fast transient is clipped rather than smoothly limited. Changing the ceiling takes effect at the next render quantum, because the clip curve cannot be ramped.
+- **Reverb:** the impulse is generated on the main thread (about 27 ms for a 5 s impulse at 48 kHz on this sandbox, and about 82 ms at 96 kHz). Generation is debounced, and identical impulses are cached. Convolution itself runs on the audio thread, and its cost grows with the decay.
+- **Bypass:** a reverb or delay tail fades out over about 40 ms when bypassed; it does not ring on.
+- **No AudioWorklet** is used. Every effect is a native node, so there is no worklet build, and no worklet-side DSP can run on the render thread.
+- **Not included:** effect parameter automation, sidechain, lookahead limiting, oversampling for the waveshaper, and any plugin hosting. Effects are not an emulation of commercial plugins.
+- **Verification scope:** offline results come from `web-audio-api` (a pure-JavaScript Web Audio implementation), not a browser. Live audibility has not been auditioned by ear; the browser specs for the rack were not run in this environment.
 
 ## Samples, synth, and starter kit — Phase 7
 
@@ -229,6 +285,6 @@ The **Add 808 starter kit** button loads seven one-shot drum sounds from `public
 
 ## Current limits
 
-Loaded audio is **session-only**. JSON keeps asset IDs, names, duration, and waveform metadata, but not decoded buffers or original file bytes. There is no persistent audio relink workflow yet. Refreshing the app also resets the in-memory project; save/load UI and IndexedDB persistence remain deferred.
+Loaded audio is **session-only**. JSON keeps asset IDs, names, duration, and waveform metadata, but not decoded buffers or original file bytes, so a reopened project whose samples were loaded in the earlier session shows them as missing. There is no persistent audio relink workflow yet. Save and Open (Phase 8) work on the project document only; IndexedDB persistence remains deferred, and refreshing the app resets the in-memory project unless it was saved.
 
-Drum channels fall back to synthesized drum voices when no sample is assigned. The bundled audio is the CC0 808 starter kit only; there is no larger library and no sample-pack download service. The synth is a single lightweight model, not a plugin or sampler: no LFO, no per-note pitch envelope, and no multi-sample mapping. There is no time stretching, audio consolidation/export, plugin hosting, or effect automation. The mixer's effect slots are wired as unity bypasses: they validate, persist, and reserve a stable chain position, but no processor runs yet. Deferred features are labeled in the UI. No external fonts, bundled media downloads, or network services are needed for the app itself.
+Drum channels fall back to synthesized drum voices when no sample is assigned. The bundled audio is the CC0 808 starter kit only; there is no larger library and no sample-pack download service. The synth is a single lightweight model, not a plugin or sampler: no LFO, no per-note pitch envelope, and no multi-sample mapping. There is no time stretching, audio consolidation/export, plugin hosting, or effect automation. Mixer effects (Phase 8) are EQ, reverb, delay, compressor, and a master limiter, with no automation and no export button. Deferred features are labeled in the UI. No external fonts, bundled media downloads, or network services are needed for the app itself.

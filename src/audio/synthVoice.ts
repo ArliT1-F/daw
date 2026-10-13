@@ -76,7 +76,7 @@ export function oscillatorDetuneOffsets(spreadCents: number): number[] {
  * behaviour; this function only creates nodes and automation.
  */
 export function buildSynthNote(
-  context: AudioContext,
+  context: BaseAudioContext,
   params: SynthParams,
   pitch: number,
   time: number,

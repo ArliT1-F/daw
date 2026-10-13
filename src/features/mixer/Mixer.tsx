@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from 'react';
+import { EffectRack } from './EffectRack';
 import { createAddMixerChannelCommand, type ProjectCommand } from '../../core/commands';
 import {
   createStableId,
@@ -22,6 +23,9 @@ import {
 import { Icon } from '../../components/Icon';
 import { PanelFrame } from '../../components/PanelFrame';
 import type { MeterViewRegistry } from './meterView';
+
+/** Above this fader position the master limiter no longer guards the output. */
+export const MASTER_LIMITER_UNITY_DB = 0;
 
 /**
  * Mixer panel.
@@ -55,6 +59,9 @@ export function Mixer({ project, collapsed, onToggle, onCommand, meterRegistry, 
   const master = getMasterChannel(project);
   const anySolo = isAnyInsertSoloed(project);
   const atInsertLimit = inserts.length >= MAX_MIXER_INSERTS;
+  // Which channel's effects rack is open. A removed channel simply stops matching and the rack hides.
+  const [rackChannelId, setRackChannelId] = useState<string | null>(null);
+  const rackChannel = rackChannelId ? project.mixerChannels.find((channel) => channel.id === rackChannelId) ?? null : null;
 
   function addChannel() {
     // The factory rejects an over-full mixer before a command is built, so stop at the limit here
@@ -111,7 +118,9 @@ export function Mixer({ project, collapsed, onToggle, onCommand, meterRegistry, 
             masterName={master?.name ?? 'Master'}
             onClearClip={onClearClip}
             onCommand={onCommand}
+            onOpenRack={setRackChannelId}
             project={project}
+            rackOpen={rackChannelId === channel.id}
             registry={meterRegistry}
           />
         ))}
@@ -124,18 +133,27 @@ export function Mixer({ project, collapsed, onToggle, onCommand, meterRegistry, 
             masterName={master.name}
             onClearClip={onClearClip}
             onCommand={onCommand}
+            onOpenRack={setRackChannelId}
             project={project}
+            rackOpen={rackChannelId === master.id}
             registry={meterRegistry}
           />
         )}
         <p className="mixer-note">
-          <span className="deferred-indicator" />
           <span>
-            Faders, pan, mute/solo, metering, and routing are live. The {MIXER_EFFECT_SLOT_COUNT} effect slots per
-            channel are wired as unity bypasses; processors arrive next.
+            Faders, pan, mute/solo, metering, routing, and up to {MIXER_EFFECT_SLOT_COUNT} effects per channel
+            (EQ, reverb, delay, compressor, limiter on master) are live and included in export.
           </span>
         </p>
       </div>
+      {rackChannel && (
+        <EffectRack
+          channelId={rackChannel.id}
+          onClose={() => setRackChannelId(null)}
+          onCommand={onCommand}
+          project={project}
+        />
+      )}
     </PanelFrame>
   );
 }
@@ -150,9 +168,11 @@ interface MixerStripProps {
   registry: MeterViewRegistry;
   onClearClip: (mixerChannelId: string) => void;
   onCommand: MixerProps['onCommand'];
+  onOpenRack: (mixerChannelId: string | null) => void;
+  rackOpen: boolean;
 }
 
-function MixerStrip({ channel, index, insertCount, masterName, project, registry, onClearClip, onCommand }: MixerStripProps) {
+function MixerStrip({ channel, index, insertCount, masterName, project, registry, onClearClip, onCommand, onOpenRack, rackOpen }: MixerStripProps) {
   const isMaster = channel.role === 'master';
   const rootRef = useRef<HTMLDivElement | null>(null);
   const gesture = useRef(0);
@@ -173,6 +193,7 @@ function MixerStrip({ channel, index, insertCount, masterName, project, registry
   }, [channel.id, registry]);
 
   const audibility = resolveMixerAudibility(channel, project);
+  const filledEffects = channel.effects.filter((slot) => slot.type !== null).length;
   const sources = listSourcesForChannel(project, channel.id);
   const coalesceKey = (control: string) => `${control}:${channel.id}:${gesture.current}`;
 
@@ -298,6 +319,14 @@ function MixerStrip({ channel, index, insertCount, masterName, project, registry
         </span>
       </div>
 
+      {isMaster && channel.volumeDb > MASTER_LIMITER_UNITY_DB && (
+        <p className="mixer-limiter-warning" role="status">
+          Fader is above 0 dB. {channel.effects.some((slot) => slot.type === 'limiter' && slot.enabled)
+            ? 'The master limiter sits before the fader, so this boost is not limited; the safety limiter after the bus still catches peaks.'
+            : 'There is no master limiter, so only the safety limiter after the bus catches peaks.'}
+        </p>
+      )}
+
       <label className="mixer-pan">
         <span className="sr-only-text">Pan of mixer channel {channel.name}</span>
         <input
@@ -377,20 +406,33 @@ function MixerStrip({ channel, index, insertCount, masterName, project, registry
       )}
 
       <div className="mixer-strip-foot">
-        <div aria-label={`Effect slots for mixer channel ${channel.name}`} className="mixer-fx" role="group">
-          {Array.from({ length: MIXER_EFFECT_SLOT_COUNT }, (_, slot) => {
-            const effect = channel.effects[slot];
-            const filled = Boolean(effect?.type);
-            return (
-              <span
-                className={`mixer-fx-slot ${filled ? 'mixer-fx-slot--filled' : ''} ${effect && !effect.enabled ? 'mixer-fx-slot--bypassed' : ''}`}
-                key={slot}
-                title={filled ? `${effect?.type ?? ''}${effect?.enabled ? '' : ' (bypassed)'}` : `Effect slot ${slot + 1} is empty · processors arrive next`}
-              >
-                {slot + 1}
-              </span>
-            );
-          })}
+        <div className="mixer-fx">
+          <button
+            aria-controls="fx-rack"
+            aria-expanded={rackOpen}
+            aria-label={`Effects for mixer channel ${channel.name}: ${filledEffects} loaded`}
+            className={`mixer-fx-button ${rackOpen ? 'mixer-fx-button--open' : ''}`}
+            onClick={() => onOpenRack(rackOpen ? null : channel.id)}
+            title={`Open the effects rack for ${channel.name}`}
+            type="button"
+          >
+            FX {filledEffects}
+          </button>
+          <span aria-label={`Effect slots for mixer channel ${channel.name}`} className="mixer-fx-slots" role="group">
+            {Array.from({ length: MIXER_EFFECT_SLOT_COUNT }, (_, slot) => {
+              const effect = channel.effects[slot];
+              const filled = Boolean(effect?.type);
+              return (
+                <span
+                  className={`mixer-fx-slot ${filled ? 'mixer-fx-slot--filled' : ''} ${effect && !effect.enabled ? 'mixer-fx-slot--bypassed' : ''}`}
+                  key={slot}
+                  title={filled ? `${effect?.type ?? ''}${effect?.enabled ? '' : ' (bypassed)'}` : `Effect slot ${slot + 1} is empty`}
+                >
+                  {slot + 1}
+                </span>
+              );
+            })}
+          </span>
         </div>
 
         <details className="mixer-sources">
